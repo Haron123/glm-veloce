@@ -10301,6 +10301,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // DeepSeek V4 Flash IQ2XXS at TP4 prefill (expert-grouped GEMM): gate/up iq2_xxs 512 x 4096, down q2_K 4096 x 512
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 256, 6, true,  512,  512, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 256, 6, false, 4096, 512, 512));
+    // Qwen3.8-Flash-Next GSQ-RCO expert down at prefill (expert-grouped GEMM): iq4_nl 2560 x 640 and q2_0 2560 x 640,
+    // 512 experts, top 10, 512 tokens; small token counts stay on the generic path
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 512, 640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0,   GGML_TYPE_F32, 512, 10, false, 2560, 512, 640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 640, 512, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0,   GGML_TYPE_F32, 512, 10, false, 640, 512, 2560));
+    // the same model's expert gate/up in iq2_s / iq3_s layers: 640 x 2560, one activation row per token (b = true)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     // DeepSeek V4 Flash IQ2XXS at TP4 decode (GCN: moe_coal_iq iq2_xxs gate/up, 256 experts, top 6), plain and the fused
     // gate/up pair with the q2_K down
     for (int64_t nt : {1, 2, 3, 4, 6}) {

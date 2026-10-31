@@ -403,6 +403,12 @@ template <> struct gkq<GGML_TYPE_Q3_K>   { static constexpr int bytes = sizeof(b
 template <> struct gkq<GGML_TYPE_Q2_K>   { static constexpr int bytes = sizeof(block_q2_K);   static constexpr int nfetch = 5; };
 // iq4_nl: 8 blocks of 32 (18 bytes each) per 256 values; a loader pair (2 blocks, 36 bytes) starts 4-byte aligned
 template <> struct gkq<GGML_TYPE_IQ4_NL> { static constexpr int bytes = 8*sizeof(block_iq4_nl); static constexpr int nfetch = 9; };
+// q2_0 (fork type): 4 blocks of 64 (18 bytes each: f16 d, 16 code bytes, 2 bits per value) per 256 values
+template <> struct gkq<GGML_TYPE_Q2_0>  { static constexpr int bytes = 4*sizeof(block_q2_0);  static constexpr int nfetch = 5; };
+// iq2_s: one 82-byte block per 256 values (f16 d, 32 grid bytes, 32 sign bytes, 8 qh bytes, 8 scale bytes)
+template <> struct gkq<GGML_TYPE_IQ2_S> { static constexpr int bytes = sizeof(block_iq2_s);  static constexpr int nfetch = 6; };
+// iq3_s: one 110-byte block per 256 values (f16 d, 64 grid bytes, 8 qh bytes, 32 sign bytes, 4 scale bytes)
+template <> struct gkq<GGML_TYPE_IQ3_S> { static constexpr int bytes = sizeof(block_iq3_s);  static constexpr int nfetch = 7; };
 // q8_0 (v4 only): 8 blocks of 32 (34 bytes each: f16 scale, 32 int8) per 256 values; GLM-5-Next keeps its KDA and MLA
 // projections in q8_0
 template <> struct gkq<GGML_TYPE_Q8_0>   { static constexpr int bytes = 8*sizeof(block_q8_0);   static constexpr int nfetch = 10; };
@@ -919,6 +925,16 @@ static __device__ __forceinline__ int gkq_sub_bytes(const int v, const unsigned 
     return (int) (((unsigned) (v | 0x80808080) - off4) ^ 0x80808080u);
 }
 
+// q2_0: spread one code byte (4 values, 2 bits each) to one int8 value per byte, then subtract 1 per byte
+// (codes 0..3 -> -1, 0, 1, 2); the |0x80 trick of gkq_sub_bytes keeps the borrows per byte
+static __device__ __forceinline__ int gkq_q20_byte(const unsigned b) {
+    const unsigned x = b & 0x33u;          // code 0 at bits 0-1, code 2 at bits 4-5
+    const unsigned y = (b >> 2) & 0x33u;   // code 1 at bits 0-1, code 3 at bits 4-5
+    const unsigned spread = (x & 0x03u) | ((x << 12) & 0x00030000u) |   // c0 -> byte 0, c2 -> byte 2
+                            ((y <<  8) & 0x00000300u) | ((y << 20) & 0x03000000u); // c1 -> byte 1, c3 -> byte 3
+    return gkq_sub_bytes((int) spread, 0x01010101u);
+}
+
 typedef short gkq_short2 __attribute__((ext_vector_type(2)));
 static __device__ __forceinline__ int gkq_sdot2(const int a, const int b, const int c) {
     return __builtin_amdgcn_sdot2(__builtin_bit_cast(gkq_short2, a), __builtin_bit_cast(gkq_short2, b), c, false);
@@ -1328,6 +1344,11 @@ static __device__ __forceinline__ uint2 gkq_iq_sign_bits(const uint32_t idx7) {
     return make_uint2(((s & 0xF)*0x00204081u) & 0x01010101u, (((s >> 4) & 0xF)*0x00204081u) & 0x01010101u);
 }
 
+// iq2_s / iq3_s signs: a direct 8-bit byte, one sign bit per value (no parity)
+static __device__ __forceinline__ uint2 gkq_iq_sign8(const uint32_t s) {
+    return make_uint2(((s & 0xF)*0x00204081u) & 0x01010101u, (((s >> 4) & 0xF)*0x00204081u) & 0x01010101u);
+}
+
 // dword d (0..7) of weight row r in the swizzled layout
 static __device__ __forceinline__ int g4_swz(const int r, const int d) {
     return 2*((d >> 1) ^ ((r >> 2) & 3)) + (d & 1);
@@ -1368,7 +1389,17 @@ static __global__ void gcn_kq4_gemm(const char * __restrict__ w, const int8_t * 
     // iq2_xxs (DeepSeek V4 Flash IQ2XXS experts): 4 grid rows of 8 magnitudes (8-bit indices) with 7-bit sign sets per
     // sub-block, one 4-bit scale per 32 values; the grid shares iq2_xs's magnitudes (2-bit codes in LDS)
     constexpr bool IS_IQ2XXS = T == GGML_TYPE_IQ2_XXS;
-    constexpr bool TWO_SC  = T == GGML_TYPE_Q6_K || T == GGML_TYPE_Q3_K || IS_IQ2XS; // a scale per 16 values
+    // iq4_nl (Qwen3.8-Flash-Next GSQ-RCO expert down): 18-byte blocks of 32 (f16 d + 16 4-bit codes through the
+    // kvalues_iq4nl table), 8 per super-block; the same int8 LDS layout and compute as iq4_xs
+    constexpr bool IS_IQ4NL  = T == GGML_TYPE_IQ4_NL;
+    // q2_0 (fork type, the same model's expert down in some layers): 18-byte blocks of 64 (f16 d + 16 2-bit code
+    // bytes), 4 per super-block; values are code-1 in {-1, 0, 1, 2}, one f16 scale per 64 values
+    constexpr bool IS_Q20    = T == GGML_TYPE_Q2_0;
+    // iq2_s / iq3_s (the same model's expert gate/up in some layers): grid lookups like iq2_xs / iq3_xxs, but the
+    // signs are direct 8-bit bytes (one per value) and the scales are 4-bit fields; iq2_s has one per 16 values
+    constexpr bool IS_IQ2S   = T == GGML_TYPE_IQ2_S;
+    constexpr bool IS_IQ3S   = T == GGML_TYPE_IQ3_S;
+    constexpr bool TWO_SC  = T == GGML_TYPE_Q6_K || T == GGML_TYPE_Q3_K || IS_IQ2XS || IS_IQ2S; // a scale per 16 values
     // q2_K: the 4-bit scales are multiplied into the LDS values (sc*q <= 45), so a sub-block is one integer dot product
     // times d; the 4-bit mins of the two halves go as an int16 pair against the activations' int16 half sums:
     // rowf = (half2 (d, dmin) bits, (m0, m1) int16 pair), colf = (d_act, (sum q_act of values 0..15, 16..31) int16 pair)
@@ -1382,9 +1413,11 @@ static __global__ void gcn_kq4_gemm(const char * __restrict__ w, const int8_t * 
     __shared__ __align__(16) float2 colf[GQ_KB][BN];       // (d_act, d_act*sum)
     __shared__ uint2    iq_g2[IS_IQ2XS && !GKQ_IQ2_PACK ? 512 : 1];          // iq2xs_grid
     __shared__ uint16_t iq_g2p[(IS_IQ2XS && GKQ_IQ2_PACK) || IS_IQ2XXS ? 512 : 1]; // iq2xs_grid / iq2xxs_grid as 2-bit codes
+    __shared__ uint16_t iq_g2s[IS_IQ2S ? 1024 : 1];                          // iq2s_grid as 2-bit codes (same byte alphabet)
     __shared__ uint32_t iq_g3[IS_IQ3XXS ? 256 : 1];         // iq3xxs_grid
+    __shared__ uint32_t iq_g3s[IS_IQ3S ? 512 : 1];          // iq3s_grid (4 magnitudes per entry)
     __shared__ uint2    iq_sg[(IS_IQ2XS || IS_IQ3XXS || IS_IQ2XXS) && !GKQ_IQ_SREG ? 128 : 1]; // ksigns_iq2xs as byte masks
-    if constexpr (IS_IQ2XS || IS_IQ3XXS || IS_IQ2XXS) {
+    if constexpr (IS_IQ2XS || IS_IQ3XXS || IS_IQ2XXS || IS_IQ2S || IS_IQ3S) {
         if constexpr (IS_IQ2XXS) {
             for (int i = threadIdx.x; i < 256; i += GQ_NT) {
                 const uint64_t g = iq2xxs_grid[i];
@@ -1410,6 +1443,22 @@ static __global__ void gcn_kq4_gemm(const char * __restrict__ w, const int8_t * 
                 } else {
                     iq_g2[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
                 }
+            }
+        } else if constexpr (IS_IQ2S) {
+            // iq2s_grid shares iq2xs's byte alphabet {8, 25, 43}: pack to 2-bit codes, 1024 entries
+            for (int i = threadIdx.x; i < 1024; i += GQ_NT) {
+                const uint64_t g = iq2s_grid[i];
+                uint32_t c = 0;
+#pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const uint32_t byte = (uint32_t) (g >> (8*v)) & 0xFF;
+                    c |= (byte == 0x08 ? 0u : byte == 0x19 ? 1u : 2u) << (2*v);
+                }
+                iq_g2s[i] = (uint16_t) c;
+            }
+        } else if constexpr (IS_IQ3S) {
+            for (int i = threadIdx.x; i < 512; i += GQ_NT) {
+                iq_g3s[i] = iq3s_grid[i];
             }
         } else {
             iq_g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
@@ -1496,6 +1545,35 @@ static __global__ void gcn_kq4_gemm(const char * __restrict__ w, const int8_t * 
             const int2 q23 = *(const int2 *) (b + 16 + 16*j);
             R.a0 = make_int4(hdr.x, hdr.y, 0, 0);
             R.a1 = make_int4(q01.x, q01.y, q23.x, q23.y);
+        } else if constexpr (IS_IQ4NL) {
+            // 18-byte block j (f16 d + 16 code bytes); blocks are 2-byte aligned, so the codes go through gkq_ld2
+            const int  j   = 4*hs + la_u;
+            const int2 q01 = gkq_ld2(b + 18*j + 2);
+            const int2 q23 = gkq_ld2(b + 18*j + 10);
+            R.a0 = make_int4(q01.x, q01.y, q23.x, q23.y);
+            R.a1 = make_int4((int) *(const unsigned short *) (b + 18*j), 0, 0, 0);
+        } else if constexpr (IS_Q20) {
+            // 18-byte block j/2 of 64 values (f16 d + 16 code bytes); sub-block j holds half j%2 (8 code bytes)
+            const int  j   = 4*hs + la_u;
+            const int2 q01 = gkq_ld2(b + 18*(j/2) + 2 + 8*(j%2));
+            R.a0 = make_int4(q01.x, q01.y, 0, 0);
+            R.a1 = make_int4((int) *(const unsigned short *) (b + 18*(j/2)), 0, 0, 0);
+        } else if constexpr (IS_IQ2S) {
+            // 82-byte block: d, qs[32] grid bytes, qs[32..63] sign bytes, qh[8], scales[8]; sub-block j = 4*hs + la_u
+            const int j = 4*hs + la_u;
+            R.a0 = make_int4(gkq_ld(b + 2 + 4*j), 0, 0, 0);                                   // 4 grid bytes
+            R.a1 = make_int4(gkq_ld(b + 2 + 32 + 4*j), 0, 0, 0);                              // 4 sign bytes
+            R.a2 = make_int4((int) *(const unsigned char *) (b + 2 + 64 + j),                // qh byte
+                             (int) *(const unsigned char *) (b + 2 + 64 + 8 + j),             // scale byte
+                             (int) *(const unsigned short *) b, 0);                           // d
+        } else if constexpr (IS_IQ3S) {
+            // 110-byte block: d, qs[64] grid bytes, qh[8], signs[32], scales[4]; sub-block j = 4*hs + la_u
+            const int j = 4*hs + la_u;
+            R.a0 = make_int4(gkq_ld(b + 2 + 8*j), gkq_ld(b + 2 + 8*j + 4), 0, 0);             // 8 grid bytes
+            R.a1 = make_int4(gkq_ld(b + 2 + 64 + 8 + 4*j), 0, 0, 0);                          // 4 sign bytes
+            R.a2 = make_int4((int) *(const unsigned char *) (b + 2 + 64 + j),                 // qh byte
+                             (int) ((*(const unsigned char *) (b + 2 + 64 + 8 + 32 + j/2) >> (4*(j % 2))) & 0xF), // scale nibble
+                             (int) *(const unsigned short *) b, 0);                           // d
         } else if constexpr (IS_IQ2XS) {
             // 74 bytes: d, qs[32] (9-bit grid index | 7-bit sign index << 9), scales[8]; sub-block ib = 4*hs + u
             const int  ib = 4*hs + la_u;
@@ -1601,6 +1679,72 @@ static __global__ void gcn_kq4_gemm(const char * __restrict__ w, const int8_t * 
             const int ls = (int) ((__builtin_amdgcn_ubfe((unsigned) R.a0.y, 8*(j/2), 8) >> (4*(j % 2))) & 0xF) |
                            (int) (__builtin_amdgcn_ubfe((unsigned) R.a0.x, 16 + 2*j, 2) << 4);
             f = make_float2(__half2float(__ushort_as_half((unsigned short) (R.a0.x & 0xFFFF)))*(float) (ls - 32), 0.0f);
+        } else if constexpr (IS_IQ4NL) {
+            // the same table expansion as iq4_xs; the scale is the block's own f16 d
+            const int q[4] = {R.a0.x, R.a0.y, R.a0.z, R.a0.w};
+            int lo[4], hi[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int2 v = get_int_from_table_16(q[k], kvalues_iq4nl);
+                lo[k] = v.x;
+                hi[k] = v.y;
+            }
+#pragma unroll
+            for (int k = 0; k < 4; k += 2) {
+                *(int2 *) &arow[la_u][g4_swz(la_row, k)]     = make_int2(lo[k], lo[k + 1]);
+                *(int2 *) &arow[la_u][g4_swz(la_row, 4 + k)] = make_int2(hi[k], hi[k + 1]);
+            }
+            f = make_float2(__half2float(__ushort_as_half((unsigned short) R.a1.x)), 0.0f);
+        } else if constexpr (IS_Q20) {
+            // 8 code bytes = 32 values, 4 per byte; byte m holds values 4m..4m+3, spread to one int8 each
+            const int qa[2] = {R.a0.x, R.a0.y};
+            int lo[4], hi[4];
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                lo[m] = gkq_q20_byte(((unsigned) qa[0] >> (8*m)) & 0xFFu);
+                hi[m] = gkq_q20_byte(((unsigned) qa[1] >> (8*m)) & 0xFFu);
+            }
+#pragma unroll
+            for (int k = 0; k < 4; k += 2) {
+                *(int2 *) &arow[la_u][g4_swz(la_row, k)]     = make_int2(lo[k], lo[k + 1]);
+                *(int2 *) &arow[la_u][g4_swz(la_row, 4 + k)] = make_int2(hi[k], hi[k + 1]);
+            }
+            f = make_float2(__half2float(__ushort_as_half((unsigned short) R.a1.x)), 0.0f);
+        } else if constexpr (IS_IQ2S) {
+            // 4 groups of 8: 10-bit grid index (qs byte | 2 qh bits) into the packed iq2s table, direct sign bits,
+            // scale (0.5 + 4-bit) * 0.25 * d per 16 values (TWO_SC)
+            const uint32_t qh = (uint32_t) R.a2.x;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t idx = (((uint32_t) R.a0.x >> (8*k)) & 0xFFu) | ((qh << (8 - 2*k)) & 0x300u);
+                const uint32_t c  = iq_g2s[idx];
+                const uint2  g    = make_uint2(gkq_iq2_unpack4(c), gkq_iq2_unpack4(c >> 8));
+                const uint2  m1   = gkq_iq_sign8((uint32_t) R.a1.x >> (8*k));
+                const uint2  m    = make_uint2(m1.x*0xFFu, m1.y*0xFFu);
+                *(int2 *) &arow[la_u][g4_swz(la_row, 2*k)] = make_int2((int) ((g.x ^ m.x) + m1.x), (int) ((g.y ^ m.y) + m1.y));
+            }
+            const float d = __half2float(__ushort_as_half((unsigned short) R.a2.z));
+            const int   sc = R.a2.y;
+            f = make_float2(d*(0.5f + (sc & 0xF))*0.25f, d*(0.5f + (sc >> 4))*0.25f);
+        } else if constexpr (IS_IQ3S) {
+            // 4 groups of 8: two 9-bit grid lookups (4 magnitudes each) per group, direct sign bits,
+            // scale (1 + 2*4-bit) * d per 32 values
+            const uint32_t qh = (uint32_t) R.a2.x;
+            const uint32_t g0 = (uint32_t) R.a0.x;  // grid bytes 0-3
+            const uint32_t g1 = (uint32_t) R.a0.y;  // grid bytes 4-7
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t pair = (k < 2 ? g0 >> (16*k) : g1 >> (16*(k - 2)));
+                const uint32_t gl = iq_g3s[(pair & 0xFF)       | ((qh << (8 - 2*k)) & 0x100u)];
+                const uint32_t gh = iq_g3s[((pair >> 8) & 0xFF) | ((qh << (7 - 2*k)) & 0x100u)];
+                const uint2  m1   = gkq_iq_sign8((uint32_t) R.a1.x >> (8*k));
+                const uint2  m    = make_uint2(m1.x*0xFFu, m1.y*0xFFu);
+                const uint2  g    = make_uint2(gl, gh);
+                *(int2 *) &arow[la_u][g4_swz(la_row, 2*k)] = make_int2((int) ((g.x ^ m.x) + m1.x), (int) ((g.y ^ m.y) + m1.y));
+            }
+            const float d = __half2float(__ushort_as_half((unsigned short) R.a2.z));
+            const int   sc = R.a2.y;
+            f = make_float2(d*(float) (1 + 2*sc), 0.0f);
         } else if constexpr (IS_IQ2XS) {
             // signs applied bytewise: (g ^ m) + (m & 1) negates where m = 0xFF (every grid byte is > 0: no carries)
             const uint32_t qq[4] = {(uint32_t) R.a0.x & 0xFFFF, (uint32_t) R.a0.x >> 16, (uint32_t) R.a0.y & 0xFFFF,
@@ -2211,10 +2355,16 @@ bool ggml_cuda_gcn_kq_moe_supported(int cc, const ggml_tensor * src0, const ggml
     static const int env_iq  = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MOE_IQ"); return e ? atoi(e) : 1; }();
     const bool iq = src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_XS ||
                     src0->type == GGML_TYPE_IQ2_XXS;
+    // iq4_nl and q2_0 (Qwen3.8-Flash-Next GSQ-RCO expert down): the v4 tiles with the i-quant routing;
+    // iq2_s and iq3_s (the same model's expert gate/up in some layers) likewise;
+    // GGML_CUDA_GCN_KQ_MOE_NLQ2=0 puts them back on MMQ
+    static const int env_nlq2 = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MOE_NLQ2"); return e ? atoi(e) : 1; }();
+    const bool nlq2 = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q2_0 ||
+                      src0->type == GGML_TYPE_IQ2_S  || src0->type == GGML_TYPE_IQ3_S;
     // q2_K (DeepSeek V4's expert down) with the K-quant threshold; GGML_CUDA_GCN_KQ_MOE_Q2K=0 off
     static const int env_q2k = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MOE_Q2K"); return e ? atoi(e) : 1; }();
     const bool type_ok = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
-                         (env_q2k && src0->type == GGML_TYPE_Q2_K) || (env_iq && iq);
+                         (env_q2k && src0->type == GGML_TYPE_Q2_K) || (env_iq && iq) || (env_nlq2 && nlq2);
     // row / expert / base alignment the tile loads need: 16-byte int4 loads (q4_K, q5_K), int2 (iq4_xs), dwords around
     // 2-byte aligned blocks (q6_K, iq2_xs, iq3_xxs)
     const size_t wal = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K ? 16 : src0->type == GGML_TYPE_IQ4_XS ? 8 : 4;
@@ -2233,7 +2383,7 @@ bool ggml_cuda_gcn_kq_moe_supported(int cc, const ggml_tensor * src0, const ggml
     // 706 t/s with the tiles here, ub 1024 796 -> 789, ub 2048 (48) 798 -> 811); GGML_CUDA_GCN_KQ_MOE_MIN_AVG_IQ2XXS
     static const int min_avg_xxs = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MOE_MIN_AVG_IQ2XXS"); return e ? atoi(e) : 32; }();
     const int64_t min_avg_t = src0->type == GGML_TYPE_IQ2_XXS ? min_avg_xxs : min_avg_iq;
-    return type_ok && (iq ? n_tokens > dec_max && avg >= min_avg_t : avg >= min_avg) && K % QK_K == 0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    return type_ok && ((iq || nlq2) ? n_tokens > dec_max && avg >= min_avg_t : avg >= min_avg) && K % QK_K == 0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[1] == n_tokens && src0->ne[3] == 1 &&
         src1->ne[3] == 1 && ggml_is_contiguous(src0) && src0->nb[1] % wal == 0 && src0->nb[2] % wal == 0 &&
         ((uintptr_t) src0->data) % wal == 0 && src1->nb[0] == sizeof(float) && src1->nb[2] == src1->ne[1]*src1->nb[1] &&
@@ -2284,8 +2434,12 @@ void ggml_cuda_gcn_kq_moe(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             case GGML_TYPE_Q5_K:    GKQ4M_BN(GGML_TYPE_Q5_K);    break;
             case GGML_TYPE_IQ2_XS:  GKQ4M_BN(GGML_TYPE_IQ2_XS);  break;
             case GGML_TYPE_IQ2_XXS: GKQ4M_BN(GGML_TYPE_IQ2_XXS); break;
+            case GGML_TYPE_IQ2_S:   GKQ4M_BN(GGML_TYPE_IQ2_S);   break;
             case GGML_TYPE_IQ3_XXS: GKQ4M_BN(GGML_TYPE_IQ3_XXS); break;
+            case GGML_TYPE_IQ3_S:   GKQ4M_BN(GGML_TYPE_IQ3_S);   break;
             case GGML_TYPE_IQ4_XS:  GKQ4M_BN(GGML_TYPE_IQ4_XS);  break;
+            case GGML_TYPE_IQ4_NL:  GKQ4M_BN(GGML_TYPE_IQ4_NL);  break;
+            case GGML_TYPE_Q2_0:   GKQ4M_BN(GGML_TYPE_Q2_0);   break;
             case GGML_TYPE_Q2_K:    GKQ4M_BN(GGML_TYPE_Q2_K);    break;
             default:                GKQ4M_BN(GGML_TYPE_Q6_K);    break;
         }

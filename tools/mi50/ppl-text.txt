@@ -1,0 +1,93 @@
+The history of computing machinery is, in large part, a history of trade-offs between
+speed, capacity, and cost. The earliest electronic computers filled entire rooms and
+consumed as much power as a small factory, yet they performed fewer arithmetic
+operations per second than a modern wristwatch. Their designers faced constraints that
+would be unrecognizable today: memory was measured in words rather than gigabytes, and
+every instruction had to be counted, because machine time was the most expensive
+resource in the laboratory.
+
+The invention of the transistor changed the economics of computation. Where a vacuum
+tube consumed watts and failed after a few thousand hours, a transistor consumed
+milliwatts and could be expected to outlive the machine around it. Integrated circuits
+carried the trend further, packing first dozens, then thousands, then billions of
+devices onto a single piece of silicon. Gordon Moore observed in 1965 that the number
+of components per integrated circuit seemed to double every year, and the industry
+proceeded to follow that observation, later called Moore's Law, for half a century.
+
+Memory technologies followed their own path. Magnetic cores, small rings of ferrite
+threaded onto wire grids, gave way to semiconductor memories in the early 1970s.
+Dynamic random access memory stored each bit as a charge on a capacitor, a scheme so
+simple and dense that it still dominates main memory today. Static random access
+memory, faster but hungrier, found its niche in caches close to the processor. The
+layering of these memories, small and fast near the core, large and slow farther away,
+became the memory hierarchy that every modern computer obeys.
+
+Graphics processors began as fixed-function helpers, drawing shaded triangles into a
+frame buffer. As the demand for realism grew, the pipelines became programmable, and
+by the middle of the 2000s researchers realized that the hardware was, at heart, a
+large array of simple arithmetic units controlled by software. General purpose
+computing on graphics hardware was born, and with it a new style of programming: the
+same instruction executed across thousands of data elements, with performance
+depending less on the speed of a single calculation than on how efficiently data
+could be moved to the units that consumed it.
+
+The economics of bandwidth deserve their own chapter. A processor can perform
+arithmetic far faster than it can fetch the operands from main memory. A cache miss
+can cost as much time as several hundred floating point operations, so the
+programmer's first duty is often not to compute less but to move less. Locality of
+reference, blocking, tiling, and prefetching are the vocabulary of this discipline.
+Kernels that stream over their data exactly once, touching each element a single
+time, approach the speed of the memory system itself; kernels that revisit memory
+haphazardly spend their lives waiting.
+
+Quantization addresses a different cost: the size of the model itself. A neural
+network trained in thirty-two bit floating point can often be served in eight bit
+integers with little measurable loss, because the network's behavior is dominated by
+a few strong signals rather than by the fine grain of its weights. The art lies in
+choosing the scale factors: per block of weights, per channel, per tensor. More
+granularity preserves accuracy but adds overhead to every computation. The most
+aggressive schemes pack two or three bits per weight, trading careful bookkeeping
+for the ability to hold a model that would otherwise not fit in memory at all.
+
+Inference with large language models is a study in two regimes. When a prompt is
+processed, many tokens pass through the network at once, and the arithmetic units
+are saturated; throughput is bounded by how fast the weights can be streamed. When
+the model generates, a single token passes through at a time, and the same weights
+are read again and again for a tiny amount of work per element; the machine is
+latency bound, and the cost of launching each small computation matters as much as
+the computation itself. Engines that serve these models therefore maintain two sets
+of kernels, one for each regime, and choose between them by the shape of the batch.
+
+Speculative decoding exploits the asymmetry between the two regimes. A small draft
+model, or a lightweight head attached to the main one, proposes several tokens at
+low cost; the large model then verifies all of them in a single batched pass,
+accepting the longest correct prefix. Because verification runs in the throughput
+regime while plain generation runs in the latency regime, several tokens can be
+confirmed for little more than the cost of one. The output distribution is provably
+unchanged, which is what makes the technique safe: the model says exactly what it
+would have said, only sooner.
+
+The parallel machines that host these workloads exchange partial results across
+wires. Where the wires are fast, the exchange is a formality; where they are slow,
+it is the central problem of the design. Engineers speak of all-reduce, the
+operation in which every participant contributes a fragment and every participant
+receives the sum. The naive implementation sends everything to one place, sums it,
+and sends it back out again. Better implementations arrange the participants in
+rings and butterflies, so that each one touches the network a bounded number of
+times. The best implementations fuse the exchange into the computation itself, so
+that no fragment is ever written to memory that another device will not read.
+
+Cooling is the quiet constraint. A data center accelerator that draws three hundred
+watts must shed three hundred watts, continuously, into air that someone must then
+move. Passive coolers rely on airflow through the chassis; a card that idles at
+thirty degrees in a cold room may throttle at ninety in a warm one, and the
+performance figures quoted in specifications are always measured at temperatures
+that a careless installer will never see. The operator's checklist is short: feed
+the front with cold air, exhaust the back, and never stack cards without a gap.
+
+Documentation is part of the machine. A kernel that cannot be understood cannot be
+tuned, and a benchmark that cannot be reproduced cannot be trusted. The discipline
+of writing down what was measured, on what hardware, with what version, is what
+separates an engineering project from a collection of anecdotes. Numbers age, but
+the habit of recording them does not, and the person who returns to a project after
+a year will thank the one who wrote down not only the results but the method.
