@@ -38,6 +38,7 @@
 #include "ggml-cuda/gcn-q8-gemm.cuh"
 #include "ggml-cuda/gcn-q8-matvec.cuh"
 #include "ggml-cuda/gcn-f16-matvec.cuh"
+#include "ggml-cuda/gcn-bf16-matvec.cuh"
 #include "ggml-cuda/gcn-kq-matvec.cuh"
 #include "ggml-cuda/mm-tile-f.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -3570,6 +3571,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // GCN: F16 weights at 1..8 tokens (coalesced 16-byte loads, f32 sums; MMVF reaches ~200 GB/s there)
     if (ggml_cuda_gcn_f16_matvec(ctx, src0, src1, dst)) {
+        return;
+    }
+    // GCN: BF16 weights at 1..8 tokens (MMVF's software bf16 conversion reaches ~75 GB/s there)
+    if (ggml_cuda_gcn_bf16_matvec(ctx, src0, src1, dst)) {
         return;
     }
     if (ggml_cuda_gcn_f32_matvec(ctx, src0, src1, dst)) {
