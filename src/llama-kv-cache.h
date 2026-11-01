@@ -162,7 +162,8 @@ public:
 
     // GLM-5-Next pooled-key cache: seq_add/seq_div regroup pools while every cached key still
     // looks complete. sticky by design, a flag that clears too early is silently wrong
-    void set_kpool_dirty();
+    // const: a graph builder that keeps no pooled keys must mark them stale, and it holds a const cache
+    void set_kpool_dirty() const;
     bool get_kpool_dirty() const;
     void clear_kpool_dirty() const;
 

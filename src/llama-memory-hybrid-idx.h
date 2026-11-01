@@ -12,6 +12,13 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+// LLAMA_QSA_KPOOL, default off (opt-in, =1 enables): cache each block's pooled indexer key in a second key head, so the
+// pool+norm+rope chain runs once per completed block instead of once per ubatch. Off by default because it measured
+// neutral at 88.7K on 2x MI50 (tg 28.66 vs 28.45; the context cost lives in the score/expand/top_k chain, not the pool
+// chain), kept as the enabler for the fused lightning indexer. Unset restores the single-head buffer and the per-ubatch
+// chain, bit-identical to before the cache existed.
+bool llama_qsa_kpool_enabled();
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -83,14 +90,29 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    //
+    // with the pooled-key cache the caller passes the four pool tensors and leaves blk_cells and
+    // blk_pos null, since no per-ubatch pool chain is built:
+    //   pool_reps      I32 [n_blocks, ns]        stream-local cell whose head 1 holds each block's key
+    //   new_pool_cells I32 [ratio*n_new_max, ns] members of the pools to (re)compute, slot order
+    //   new_pool_reps  I64 [n_new_max*ns]        GLOBAL dest rows, the cpy_k_part convention
+    //   upd_pos        I32 [4*n_new_max*ns]      mrope rows for the update rope, blk_pos layout
+    // rebuild re-emits every complete block, not only those this ubatch closed. strm_of maps a
+    // view stream to its physical stream, so a global row is strm_of[s]*kv_size + cell
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * pool_reps, ggml_tensor * new_pool_cells, ggml_tensor * new_pool_reps,
+                       ggml_tensor * upd_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool rebuild, const uint32_t * strm_of) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
+
+    // a pooled key is a pure function of its block's cells, so anything structural must re-pool
+    // once. conservative on purpose: a needless rebuild costs one pass, a missed one serves a stale key
+    void kpool_invalidate();
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
@@ -142,8 +164,10 @@ public:
     uint32_t get_n_stream() const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * pool_reps, ggml_tensor * new_pool_cells, ggml_tensor * new_pool_reps,
+                       ggml_tensor * upd_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool rebuild) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

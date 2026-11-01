@@ -1219,7 +1219,7 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
-void llama_kv_cache::set_kpool_dirty() {
+void llama_kv_cache::set_kpool_dirty() const {
     kpool_dirty = true;
 }
 
