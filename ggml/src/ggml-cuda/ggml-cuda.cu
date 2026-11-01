@@ -9257,6 +9257,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const enum ggml_status st = ggml_backend_cuda_graph_compute_impl(backend, cgraph);
     CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), ggml_cuda_timeline::cb_end, e));
     e->h1 = ggml_cuda_timeline::now();
+    // GGML_CUDA_TIMELINE_GRAPH=1: one line per graph compute with the host span (the
+    // destructor's full dump only happens on a clean exit, which a stopped server skips)
+    static const bool tl_graph = getenv("GGML_CUDA_TIMELINE_GRAPH") != nullptr && atoi(getenv("GGML_CUDA_TIMELINE_GRAPH")) != 0;
+    if (tl_graph) {
+        fprintf(stderr, "TLGRAPH dev %d nodes %d h0 %.3f h1 %.3f host %.3f ms\n", e->dev, e->n_nodes,
+                (e->h0 % 10000000000LL)/1e3, (e->h1 % 10000000000LL)/1e3, (e->h1 - e->h0)/1e3);
+    }
     return st;
 }
 
