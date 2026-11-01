@@ -243,12 +243,14 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
-        if (mmvf_pipe != 0 && ncols_dst <= 2) {
+        if (mmvf_pipe != 0 && ncols_dst <= 2 && ncols2 >= 4*block_size) {
             // GCN latency fix: the sequential loop below issues one 4 B weight load per FMA pair and
             // leaves the memory pipeline mostly idle (the hyper-connection matvecs stream at ~150 GB/s
             // on gfx906). This loop processes 4 strided columns per step so all 8 loads of the group
             // issue before the first FMA. The per-thread FMA order over col2 is the sequential loop's,
-            // so the result is bit-identical. GGML_CUDA_MMVF_PIPE=0 restores the sequential loop.
+            // so the result is bit-identical. Only taken when every thread runs >= 4 iterations
+            // (ncols2 >= 4*block_size): below that the clamped padding loads would cost more than
+            // the pipeline saves. GGML_CUDA_MMVF_PIPE=0 restores the sequential loop.
             for (int base = tid; base < ncols2; base += 4*block_size) {
                 const int c1 = base +   block_size;
                 const int c2 = base + 2*block_size;
