@@ -1067,6 +1067,63 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    // decode: attend to the gathered rows of the selected cells instead of masking the whole cache.
+    // The masked path runs flash attention over all n_kv cells (99% of them -inf at long context); the
+    // gather pulls the n_sel selected rows out of the cache and attends to those (~2051 vs 88K at
+    // max context). The selection is identical to the masked path's; only the FA kernel's input differs
+    // (f16 KV: the two agree to ~5e-7, Cudila's measurement on the same architecture). The gather costs a
+    // fixed ~n_sel rows plus a few launches per layer, so a short context stays on the masked path.
+    // LLAMA_QSA_GATHER=1 enables (measured NEUTRAL at 88K on 2x MI50 - the masked FA over the whole
+    // cache costs only ~1 ms/token there because just 12 of 48 layers run full attention; the gather
+    // should win at 200K+ contexts where the masked FA reads 3x more); LLAMA_QSA_GATHER_MIN_KV
+    // overrides the depth threshold (default 8*n_sel).
+    static const bool gather_env = [] { const char * e = getenv("LLAMA_QSA_GATHER"); return e && atoi(e) != 0; }();
+    static const int64_t gather_min_kv_mult = [] { const char * e = getenv("LLAMA_QSA_GATHER_MIN_KV"); return e ? atoll(e) : 8; }();
+    {
+        const int64_t n_sel   = top_k->ne[0];
+        const int64_t n_tps   = top_k->ne[1];
+        const int64_t n_strm  = top_k->ne[3];
+        const int64_t n_kv_gc = kq_mask->ne[0];
+        const bool gather = gather_env && cparams.flash_attn && n_tps <= 8 && n_strm == 1 &&
+            n_kv_gc >= gather_min_kv_mult*n_sel && n_sel > 0;
+        if (gather) {
+            // each token's selected cells: [n_sel, n_tps, 1, 1] -> [n_sel, n_tps, 1]
+            ggml_tensor * sel = ggml_reshape_3d(ctx0, top_k, n_sel, n_tps, 1);
+
+            // the per-cell visibility mask (empty, foreign, future), gathered along with the rows
+            ggml_tensor * m = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], 1,
+                    kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[3], 0);
+            ggml_tensor * m_sel = ggml_get_rows(ctx0, m, sel);
+            ggml_tensor * mask = ggml_reshape_4d(ctx0, m_sel, n_sel, 1, 1, n_tps);
+            // the flash attention kernel requires an F16 mask
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+
+            ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+            ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+            GGML_ASSERT(k->ne[3] == 1 && v->nb[1] <= v->nb[2]);
+
+            // one cell is n_head_kv rows of n_embd_head, contiguous in the cache, so gather whole cells;
+            // each token has its own selection: the token becomes the stream dimension of the attention
+            ggml_tensor * sel1 = ggml_reshape_1d(ctx0, sel, n_sel*n_tps);
+
+            ggml_tensor * k_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, k, k->ne[0]*k->ne[1], n_kv_gc, k->nb[2], 0), sel1);
+            k_sel = ggml_reshape_4d(ctx0, k_sel, k->ne[0], k->ne[1], n_sel, n_tps);
+
+            ggml_tensor * v_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, v, v->ne[0]*v->ne[1], n_kv_gc, v->nb[2], 0), sel1);
+            v_sel = ggml_reshape_4d(ctx0, v_sel, v->ne[0], v->ne[1], n_sel, n_tps);
+
+            ggml_tensor * cur = build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+            cb(cur, "kqv_out", il);
+
+            // the rotation is its own inverse, so undo it on the value side of the output
+            if (inp->self_v_rot) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            }
+
+            return cur;
+        }
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
