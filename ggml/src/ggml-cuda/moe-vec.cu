@@ -1164,6 +1164,36 @@ static __device__ __forceinline__ moe_iq_raw moe_iq_load(const char * __restrict
         r.d = *(const uint16_t *) b;
         r.a = moe_iq_u16x2(b + 2 + 8*ib);
         r.b = moe_iq_u16x2(b + 6 + 8*ib);
+    } else if constexpr (type == GGML_TYPE_IQ4_NL) {
+        // 18 bytes per 32 values: d, qs[16] (value j in the low nibble of byte j, value 16 + j in its high nibble);
+        // 2-byte-safe loads (18-byte blocks are never 4-byte aligned)
+        const char * b = row + it*sizeof(block_iq4_nl);
+        r.d = *(const uint16_t *) b;
+        r.a = moe_iq_u16x2(b + 2);
+        r.b = moe_iq_u16x2(b + 6);
+        r.c = moe_iq_u16x2(b + 10);
+        r.e = moe_iq_u16x2(b + 14);
+    } else if constexpr (type == GGML_TYPE_Q2_0) {
+        // 18 bytes per 64 values (this fork's QK2_0 = 64): d, qs[16]; item it is chunk it%2 of block it/2
+        const char * b = row + (it/2)*sizeof(block_q2_0);
+        r.d = *(const uint16_t *) b;
+        r.a = moe_iq_u16x2(b + 2 + 8*(it % 2));
+        r.b = moe_iq_u16x2(b + 6 + 8*(it % 2));
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        // 82 bytes per 256: d, qs[32] grid indices, qs[32..63] sign bytes, qh[8], scales[8]
+        const char * b = row + sb*sizeof(block_iq2_s);
+        r.d = *(const uint16_t *) b;
+        r.a = moe_iq_u16x2(b + 2 + 4*ib);
+        r.b = moe_iq_u16x2(b + 2 + 32 + 4*ib);
+        r.c = (uint32_t) (uint8_t) b[2 + 64 + ib] | ((uint32_t) (uint8_t) b[2 + 64 + 8 + ib] << 8);
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        // 110 bytes per 256: d, qs[64] (8 grid bytes per sub-block), qh[8], signs[32], scales[4]
+        const char * b = row + sb*sizeof(block_iq3_s);
+        r.d = *(const uint16_t *) b;
+        r.a = moe_iq_u16x2(b + 2 + 8*ib);
+        r.e = moe_iq_u16x2(b + 2 + 8*ib + 4);
+        r.b = moe_iq_u16x2(b + 2 + 64 + 8 + 4*ib);
+        r.c = (uint32_t) (uint8_t) b[2 + 64 + ib] | ((uint32_t) (uint8_t) b[2 + 64 + 8 + 32 + ib/2] << 8);
     } else {
         static_assert(type == GGML_TYPE_IQ3_XXS, "unsupported type");
         // 98 bytes: d, qs[64] (grid indices, 4 values each), then per sub-block 4 x 7-bit sign sets | scale << 28
@@ -1219,7 +1249,7 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
             s = ggml_cuda_dp4a(v1, yq[2*k + 1], ggml_cuda_dp4a(v0, yq[2*k], s));
         }
         return d*0.125f*__low2float(yb->ds)*(float) ((2*(int) (r.b >> 28) + 1)*s);
-    } else {
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
         int s = 0;
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
@@ -1232,6 +1262,86 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
             s = ggml_cuda_dp4a(v1, yq[2*k + 1], ggml_cuda_dp4a(v0, yq[2*k], s));
         }
         return d*0.25f*__low2float(yb->ds)*(float) ((2*(int) (r.c >> 28) + 1)*s);
+    } else if constexpr (type == GGML_TYPE_IQ4_NL) {
+        // non-linear 4-bit values from kvalues_iq4nl by byte permutes (no tables in LDS), as the iq4_xs case
+        int s = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int2 v = get_int_from_table_16((int) (k == 0 ? r.a : k == 1 ? r.b : k == 2 ? r.c : r.e), kvalues_iq4nl);
+            s = ggml_cuda_dp4a(v.y, yq[k + 4], ggml_cuda_dp4a(v.x, yq[k], s));
+        }
+        return d*__low2float(yb->ds)*(float) s;
+    } else if constexpr (type == GGML_TYPE_Q2_0) {
+        // 2-bit crumbs unpacked by the HIP perm path of vec_dot_q2_0_q8_1 (sign-extended 16-bit words)
+        int s = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q  = (int) (int16_t) (uint16_t) ((j < 2 ? r.a : r.b) >> (16*(j & 1)));
+            const int u  = get_int_b4(yb->qs, 2*j + 0);
+            const int v  = get_int_b4(yb->qs, 2*j + 1);
+            const uint32_t qx_indices = ((uint32_t) q & 0x03) | (((uint32_t) q & 0x0C) << 6) | (((uint32_t) q & 0x30) << 12) | (((uint32_t) q & 0xC0) << 18);
+            const uint32_t qy_bits    = (uint32_t) q >> 8;
+            const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
+            const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+            const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+            s = ggml_cuda_dp4a(u, qx, s);
+            s = ggml_cuda_dp4a(v, qy, s);
+        }
+        return d*__low2float(yb->ds)*(float) s;
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        // 10-bit grid index (8-bit qs + 2 qh bits), direct sign bits, TWO_SC nibble scales:
+        // the arithmetic of vec_dot_iq2_s_q8_1 (sumi0/sumi1 = the two 16-value halves)
+        const uint8_t * qs = (const uint8_t *) &r.a;
+        const uint8_t * signs_packed_8 = (const uint8_t *) &r.b;
+        const int qh  = (int) (r.c & 0xFF);
+        const int ls0 = (int) ((r.c >> 8) & 0x0F);
+        const int ls1 = (int) ((r.c >> 8) >> 4);
+        int sumi0 = 0;
+        int sumi1 = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint2 g = g2[qs[l0/2] | ((qh << (8 - l0)) & 0x300)];
+            const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+            const int grid_l = __vsub4((int) g.x ^ signs0, signs0);
+            const int grid_h = __vsub4((int) g.y ^ signs1, signs1);
+            const int u0 = get_int_b4(yb->qs, l0 + 0);
+            const int u1 = get_int_b4(yb->qs, l0 + 1);
+            if (l0 < 4) {
+                sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+                sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+            } else {
+                sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+                sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+            }
+        }
+        const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+        return d*__low2float(yb->ds)*(float) sumi;
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        // 9-bit grid index (8-bit qs + 1 qh bit), direct sign bits, parity-selected scale nibble:
+        // the arithmetic of vec_dot_iq3_s_q8_1
+        const int2 qp = make_int2((int) r.a, (int) r.e);
+        const uint8_t * qs = (const uint8_t *) &qp;
+        const uint8_t * signs_packed_8 = (const uint8_t *) &r.b;
+        const int qh = (int) (r.c & 0xFF);
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int gl = (int) g3[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+            const int gh = (int) g3[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+            const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+            const int grid_l = __vsub4(gl ^ signs0, signs0);
+            const int grid_h = __vsub4(gh ^ signs1, signs1);
+            const int u0 = get_int_b4(yb->qs, l0 + 0);
+            const int u1 = get_int_b4(yb->qs, l0 + 1);
+            sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+            sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+        }
+        sumi *= 1 + 2*((int) (((r.c >> 8) >> (4*(it & 1))) & 0x0F));
+        return d*__low2float(yb->ds)*(float) sumi;
+    } else {
+        static_assert(type == GGML_TYPE_IQ3_XXS, "unsupported type");
     }
 }
 
@@ -1253,10 +1363,14 @@ static __global__ void moe_coal_iq(
     constexpr bool X2 = type == GGML_TYPE_IQ2_XS;
     constexpr bool I4 = type == GGML_TYPE_IQ4_XS; // no LDS tables
     constexpr bool XX = type == GGML_TYPE_IQ2_XXS;
+    constexpr bool NL = type == GGML_TYPE_IQ4_NL; // no LDS tables (kvalues permutes)
+    constexpr bool Q20 = type == GGML_TYPE_Q2_0; // no LDS tables
+    constexpr bool I2S = type == GGML_TYPE_IQ2_S; // iq2s_grid in g2, direct signs
+    constexpr bool I3S = type == GGML_TYPE_IQ3_S; // iq3s_grid in g3, direct signs
     constexpr int  PF = MOE_IQ_PF;
-    __shared__ uint2    g2[X2 ? 512 : XX ? 256 : 1];     // iq2xs_grid / iq2xxs_grid
-    __shared__ uint32_t g3[X2 || I4 || XX ? 1 : 256];    // iq3xxs_grid
-    __shared__ uint2    sg[I4 ? 1 : 128];         // ksigns_iq2xs expanded to byte masks (0x00 / 0xFF per value)
+    __shared__ uint2    g2[X2 ? 512 : XX ? 256 : I2S ? 1024 : 1];  // iq2xs_grid / iq2xxs_grid / iq2s_grid
+    __shared__ uint32_t g3[X2 || I4 || XX || NL || Q20 || I2S ? 1 : I3S ? 512 : 256]; // iq3xxs_grid / iq3s_grid
+    __shared__ uint2    sg[I4 || NL || Q20 || I2S || I3S ? 1 : 128]; // ksigns_iq2xs expanded to byte masks (0x00 / 0xFF per value)
     extern __shared__ int4 ys_raw[];
     block_q8_1 * ys = (block_q8_1 *) ys_raw;
 
@@ -1272,10 +1386,21 @@ static __global__ void moe_coal_iq(
     } else if constexpr (XX) {
         const uint64_t g = iq2xxs_grid[threadIdx.x];
         g2[threadIdx.x] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
-    } else if constexpr (!I4) {
-        g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
+    } else if constexpr (I2S) {
+        for (int i = threadIdx.x; i < 1024; i += 256) {
+            const uint64_t g = iq2s_grid[i];
+            g2[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
+        }
+    } else if constexpr (!I4 && !NL && !Q20) {
+        if constexpr (I3S) {
+            for (int i = threadIdx.x; i < 512; i += 256) {
+                g3[i] = iq3s_grid[i];
+            }
+        } else {
+            g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
+        }
     }
-    if (!I4 && threadIdx.x < 128) {
+    if (!I4 && !NL && !Q20 && !I2S && !I3S && threadIdx.x < 128) {
         const uint32_t s = ksigns_iq2xs[threadIdx.x];
         uint32_t lo = 0, hi = 0;
 #pragma unroll
@@ -1374,11 +1499,15 @@ static __global__ void moe_coal_iq_flat(
     constexpr bool X2 = type == GGML_TYPE_IQ2_XS;
     constexpr bool I4 = type == GGML_TYPE_IQ4_XS;
     constexpr bool XX = type == GGML_TYPE_IQ2_XXS;
+    constexpr bool NL = type == GGML_TYPE_IQ4_NL;
+    constexpr bool Q20 = type == GGML_TYPE_Q2_0;
+    constexpr bool I2S = type == GGML_TYPE_IQ2_S;
+    constexpr bool I3S = type == GGML_TYPE_IQ3_S;
     constexpr int  PF = 2;
     constexpr int  RPT = 256/LPR; // rows per task
-    __shared__ uint2    g2[X2 ? 512 : XX ? 256 : 1];
-    __shared__ uint32_t g3[X2 || I4 || XX ? 1 : 256];
-    __shared__ uint2    sg[I4 ? 1 : 128];
+    __shared__ uint2    g2[X2 ? 512 : XX ? 256 : I2S ? 1024 : 1];
+    __shared__ uint32_t g3[X2 || I4 || XX || NL || Q20 || I2S ? 1 : I3S ? 512 : 256];
+    __shared__ uint2    sg[I4 || NL || Q20 || I2S || I3S ? 1 : 128];
     extern __shared__ int4 ys_raw[];
     block_q8_1 * ys = (block_q8_1 *) ys_raw;
 
@@ -1392,10 +1521,21 @@ static __global__ void moe_coal_iq_flat(
     } else if constexpr (XX) {
         const uint64_t g = iq2xxs_grid[threadIdx.x];
         g2[threadIdx.x] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
-    } else if constexpr (!I4) {
-        g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
+    } else if constexpr (I2S) {
+        for (int i = threadIdx.x; i < 1024; i += 256) {
+            const uint64_t g = iq2s_grid[i];
+            g2[i] = make_uint2((uint32_t) g, (uint32_t) (g >> 32));
+        }
+    } else if constexpr (!I4 && !NL && !Q20) {
+        if constexpr (I3S) {
+            for (int i = threadIdx.x; i < 512; i += 256) {
+                g3[i] = iq3s_grid[i];
+            }
+        } else {
+            g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
+        }
     }
-    if (!I4 && threadIdx.x < 128) {
+    if (!I4 && !NL && !Q20 && !I2S && !I3S && threadIdx.x < 128) {
         const uint32_t sv = ksigns_iq2xs[threadIdx.x];
         uint32_t lo = 0, hi = 0;
 #pragma unroll
@@ -2236,9 +2376,14 @@ static bool moe_iq_dec_ok(int cc, const ggml_tensor * src0, const ggml_tensor * 
     static const int env  = moe_vec_env("GGML_CUDA_MOE_IQ_DEC", 1);
     static const int env4 = moe_vec_env("GGML_CUDA_MOE_IQ4_DEC", 1);
     static const int envx = moe_vec_env("GGML_CUDA_MOE_IQ2XXS_DEC", 1);
+    // the 4 Qwen3.8-Flash-Next expert types (iq4_nl / q2_0 down, iq2_s / iq3_s gate-up): GGML_CUDA_MOE_IQ_DEC2=0
+    // puts them back on MMVQ (a rounding change vs the coal path, like the 3 types above)
+    static const int env2 = moe_vec_env("GGML_CUDA_MOE_IQ_DEC2", 1);
     const bool bcast = src1->ne[1] == 1;
     const bool i4    = src0->type == GGML_TYPE_IQ4_XS;
     const int  al    = i4 ? 8 : 2; // iq4_xs loads qs as 8-byte pairs
+    const bool new4  = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q2_0 ||
+                       src0->type == GGML_TYPE_IQ2_S  || src0->type == GGML_TYPE_IQ3_S;
     // tokens per call (GGML_CUDA_MOE_IQ_DEC_MAX; the expert-grouped GEMM in gcn-q8-gemm.cu starts above 64): the per-slot
     // coalesced kernel beats the GEMM well past decode sizes. GLM-5.3 Q2 TP4 forward ms, GEMM -> here: 5 tokens 62.9 -> 32.5,
     // 8: 80.3 -> 45.1, 16: 120.9 -> 78.8, 32: 178.0 -> 141.3, 64: 229.0 -> 199.0, 96: 274.3 -> 268.4. iq2_xxs (DeepSeek V4,
@@ -2246,7 +2391,7 @@ static bool moe_iq_dec_ok(int cc, const ggml_tensor * src0, const ggml_tensor * 
     static const int env_max = moe_vec_env("GGML_CUDA_MOE_IQ_DEC_MAX", 0);
     const int max_tok = env_max > 0 ? std::min(env_max, 256) : src0->type == GGML_TYPE_IQ2_XXS ? 32 : 64;
     return env && GGML_CUDA_CC_IS_GCN(cc) && (src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ3_XXS || (i4 && env4) ||
-         (src0->type == GGML_TYPE_IQ2_XXS && envx)) &&
+         (src0->type == GGML_TYPE_IQ2_XXS && envx) || (new4 && env2)) &&
         src0->ne[0] % QK_K == 0 && src0->ne[0] <= 8192 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
         src0->nb[1] % al == 0 && src0->nb[2] % al == 0 && ((uintptr_t) src0->data) % al == 0 &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
@@ -2359,6 +2504,14 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
                 MOE_IQ_FLAT_L(GGML_TYPE_IQ4_XS, false)
             } else if (src0->type == GGML_TYPE_IQ2_XXS) {
                 if (up_src0) { MOE_IQ_FLAT_L(GGML_TYPE_IQ2_XXS, true) } else { MOE_IQ_FLAT_L(GGML_TYPE_IQ2_XXS, false) }
+            } else if (src0->type == GGML_TYPE_IQ4_NL) {
+                MOE_IQ_FLAT_L(GGML_TYPE_IQ4_NL, false)
+            } else if (src0->type == GGML_TYPE_Q2_0) {
+                MOE_IQ_FLAT_L(GGML_TYPE_Q2_0, false)
+            } else if (src0->type == GGML_TYPE_IQ2_S) {
+                if (up_src0) { MOE_IQ_FLAT_L(GGML_TYPE_IQ2_S, true) } else { MOE_IQ_FLAT_L(GGML_TYPE_IQ2_S, false) }
+            } else if (src0->type == GGML_TYPE_IQ3_S) {
+                if (up_src0) { MOE_IQ_FLAT_L(GGML_TYPE_IQ3_S, true) } else { MOE_IQ_FLAT_L(GGML_TYPE_IQ3_S, false) }
             } else {
                 if (up_src0) { MOE_IQ_FLAT_L(GGML_TYPE_IQ3_XXS, true) } else { MOE_IQ_FLAT_L(GGML_TYPE_IQ3_XXS, false) }
             }
@@ -2393,6 +2546,14 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
             MOE_IQ_L(GGML_TYPE_IQ4_XS, false)
         } else if (src0->type == GGML_TYPE_IQ2_XXS) {
             if (up_src0) { MOE_IQ_L(GGML_TYPE_IQ2_XXS, true) } else { MOE_IQ_L(GGML_TYPE_IQ2_XXS, false) }
+        } else if (src0->type == GGML_TYPE_IQ4_NL) {
+            MOE_IQ_L(GGML_TYPE_IQ4_NL, false)
+        } else if (src0->type == GGML_TYPE_Q2_0) {
+            MOE_IQ_L(GGML_TYPE_Q2_0, false)
+        } else if (src0->type == GGML_TYPE_IQ2_S) {
+            if (up_src0) { MOE_IQ_L(GGML_TYPE_IQ2_S, true) } else { MOE_IQ_L(GGML_TYPE_IQ2_S, false) }
+        } else if (src0->type == GGML_TYPE_IQ3_S) {
+            if (up_src0) { MOE_IQ_L(GGML_TYPE_IQ3_S, true) } else { MOE_IQ_L(GGML_TYPE_IQ3_S, false) }
         } else {
             if (up_src0) { MOE_IQ_L(GGML_TYPE_IQ3_XXS, true) } else { MOE_IQ_L(GGML_TYPE_IQ3_XXS, false) }
         }
