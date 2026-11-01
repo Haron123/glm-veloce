@@ -1669,15 +1669,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 // to mul_mat_vec_q; GGML_CUDA_MMVQ_LDS=0 puts the generic kernel back)
                 if constexpr (gcn_mmvq_lds_type_ok<type>()) {
                     if (gcn_mmvq_lds_host_enabled() && table_id == MMVQ_PARAMETERS_GCN && GGML_CUDA_CC_IS_GCN(cc)) {
-                        { // TEMP: activation log (first 20 calls)
-                            static int n_log = 0;
-                            if (n_log < 20) {
-                                ++n_log;
-                                fprintf(stderr, "[gcn_mmvq_lds] call %d: type=%s K=%d M=%d small_k=%d fusion=%d ids=%d\n",
-                                        n_log, ggml_type_name(type), (int) ncols_x, (int) nrows_x, (int) c_small_k,
-                                        (int) (fusion.gate != nullptr), ids != nullptr);
-                            }
-                        }
                         gcn_mmvq_lds_switch_fusion<type, c_small_k, c_halve_iters>(
                             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                             channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
