@@ -473,6 +473,66 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+#if defined(GGML_USE_HIP)
+// GCN rows-per-CTA packing for the tall short-K bf16 matvec (the hyper-connection up matrices,
+// 10240x320: mul_mat_vec_f launches one 128-thread CTA per row and the kernel is CTA
+// prologue/epilogue-bound: ~40 us for 6.5 MB = ~160 GB/s). This kernel packs 4 rows into one
+// 512-thread CTA; each 128-thread group computes its row with mul_mat_vec_f's exact col2
+// partition and reduction tree (warp butterfly, cross-warp LDS exchange, first-warp reduce of
+// the zero-padded partials), so every row's result is bit-identical. Routed only for bf16,
+// ncols_dst == 1, no ids, no fusion, one channel/sample, tall (nrows >= 2048) and short K
+// (ncols2 <= 2*block_size, where the 4-deep pipeline cannot help).
+// GGML_CUDA_MMVF_ROWS4=0 puts mul_mat_vec_f back.
+template <int block_size>
+__launch_bounds__(4*block_size, 1)
+static __global__ void gcn_mmvf_rows4_bf16(
+        const nv_bfloat16 * __restrict__ xw, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols2, const int nrows, const int64_t stride_row) {
+    constexpr int warp_size = 64; // GCN physical wavefront
+    const int group = threadIdx.x / block_size;
+    const int tid   = threadIdx.x - group*block_size;
+    const int row   = blockIdx.x*4 + group;
+    const bool live = row < nrows;
+    const int rowc  = live ? row : nrows - 1; // clamped: every load stays in bounds
+
+    const int * x2 = (const int *) (xw + (int64_t) rowc*stride_row);
+    const float2 * y2 = (const float2 *) y;
+
+    __shared__ float buf_iw[4][warp_size];
+
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[group][tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const int tmpx = x2[col2];
+        const float2 tmpy = y2[col2];
+        const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
+        const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
+        ggml_cuda_mad(sumf, tmpx0, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx1, tmpy.y);
+    }
+
+    ggml_cuda_pdl_lc();
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    if (block_size > warp_size) {
+        buf_iw[group][tid/warp_size] = sumf;
+        __syncthreads();
+        if (tid < warp_size) {
+            sumf = buf_iw[group][tid];
+            sumf = warp_reduce_sum<warp_size>(sumf);
+        }
+    }
+    if (live && tid == 0) {
+        dst[row] = sumf; // ncols_dst == 1: dst[0*stride_col_dst + row]
+    }
+}
+#endif // GGML_USE_HIP
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -544,6 +604,35 @@ void launch_mul_mat_vec_f_cuda(
     // GGML_CUDA_MMVF_PIPE=0: the sequential col2 loop (the pipelined variant is bit-identical,
     // the switch exists for A/B measurement)
     static const int mmvf_pipe = [] { const char * e = getenv("GGML_CUDA_MMVF_PIPE"); return e ? atoi(e) : 1; }();
+
+#if defined(GGML_USE_HIP)
+    // tall short-K bf16 matvec (the HC up matrices): 4 rows per CTA, bit-identical per row
+    static const int mmvf_rows4 = [] { const char * e = getenv("GGML_CUDA_MMVF_ROWS4"); return e ? atoi(e) : 1; }();
+    if constexpr (std::is_same_v<T, nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id) {
+        if (mmvf_rows4 != 0 && !has_fusion && ids == nullptr && nchannels_dst == 1 && nsamples_dst == 1 &&
+                nrows >= 2048 && ncols/2 <= 2*block_size_best) {
+            const int64_t nrows4 = (nrows + 3)/4;
+            const dim3 block_nums4(nrows4, 1, 1);
+            const dim3 block_dims4(4*block_size_best, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params4 = {block_nums4, block_dims4, 0, stream};
+            switch (block_size_best) {
+                case 128: {
+                    ggml_cuda_kernel_launch(gcn_mmvf_rows4_bf16<128>, launch_params4,
+                        (const nv_bfloat16 *) x, y, dst, (int) (ncols/2), (int) nrows, stride_row);
+                    return;
+                } break;
+                case 256: {
+                    ggml_cuda_kernel_launch(gcn_mmvf_rows4_bf16<256>, launch_params4,
+                        (const nv_bfloat16 *) x, y, dst, (int) (ncols/2), (int) nrows, stride_row);
+                    return;
+                } break;
+                default: {
+                    // fall through to the generic path (block sizes < 128 do not occur on GCN)
+                } break;
+            }
+        }
+    }
+#endif // GGML_USE_HIP
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
