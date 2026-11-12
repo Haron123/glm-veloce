@@ -2280,7 +2280,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        // GGML_SCHED_EVENTS_ALWAYS (default 1): events also without pipeline copies, so a cross-device input waits on the
+        // GPU for the destination's previous use instead of a host synchronize of the destination (the MTP draft
+        // context: ~1 ms of host blocking and ~70 us of GPU idle per draft step at the split that joins the two head halves)
+        static const bool events_always = [] { const char * e = getenv("GGML_SCHED_EVENTS_ALWAYS"); return !e || atoi(e) != 0; }();
+        if (sched->n_copies > 1 || events_always) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
