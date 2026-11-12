@@ -4758,9 +4758,30 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
     CUDA_CHECK(cudaEventRecord(slot.done, h2d_stream));
 }
 
-// per (virtual) device: an event recorded after each graph compute of a device that receives P2P stage hand-offs
-static cudaEvent_t g_cuda_compute_done[GGML_CUDA_MAX_DEVICES] = {};
-static bool        g_cuda_p2p_dst[GGML_CUDA_MAX_DEVICES]      = {};
+// per stream (contexts of one device, e.g. MTP target and draft, have their own streams): no graph compute was launched
+// since the host last synchronized the stream, so nothing queued there can still read a hand-off destination
+// (set in synchronize, cleared in graph_compute)
+static std::mutex g_cuda_fresh_mtx;
+static std::vector<std::pair<cudaStream_t, bool>> g_cuda_fresh;
+static void ggml_cuda_set_fresh(cudaStream_t st, bool fresh) {
+    std::lock_guard<std::mutex> lock(g_cuda_fresh_mtx);
+    for (auto & e : g_cuda_fresh) {
+        if (e.first == st) {
+            e.second = fresh;
+            return;
+        }
+    }
+    g_cuda_fresh.emplace_back(st, fresh);
+}
+static bool ggml_cuda_is_fresh(cudaStream_t st) {
+    std::lock_guard<std::mutex> lock(g_cuda_fresh_mtx);
+    for (const auto & e : g_cuda_fresh) {
+        if (e.first == st) {
+            return e.second;
+        }
+    }
+    return false;
+}
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
@@ -4818,16 +4839,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             static cudaEvent_t ev_dst_dev[GGML_CUDA_MAX_DEVICES] = {};
             cudaEvent_t & ev_dst = ev_dst_dev[cuda_ctx_dst->device];
             ggml_cuda_set_device(cuda_ctx_dst->device);
-            // dst is read only by graph computes on the destination device; once its last one has finished (an event
-            // recorded after every compute of a hand-off destination), no read of dst can be pending and the wait on
-            // the other GPU's event (~15 us even when already signaled) is skipped. Decode: the host enqueues each token
-            // after syncing the previous one, so this holds for every stage hand-off. GGML_CUDA_P2P_IDLE_SKIP=0: always wait
+            // dst is read only by graph computes on the destination device; if none was launched there since the host
+            // synchronized it, no read of dst can be pending and the wait on the other GPU's event (an event packet,
+            // ~3-5 us of GPU time, plus the cross-device signal) is skipped. Decode: the host enqueues each token after
+            // syncing the previous one, so this holds for every stage hand-off. GGML_CUDA_P2P_IDLE_SKIP=0: always wait
             static const bool idle_skip = [] { const char * e = getenv("GGML_CUDA_P2P_IDLE_SKIP"); return !e || atoi(e) != 0; }();
-            const int dd = cuda_ctx_dst->device;
-            g_cuda_p2p_dst[dd] = idle_skip;
-            const bool dst_idle = idle_skip && g_cuda_compute_done[dd] != nullptr && hipEventQuery(g_cuda_compute_done[dd]) == hipSuccess;
+            const bool dst_idle = idle_skip && ggml_cuda_is_fresh(cuda_ctx_dst->stream());
             if (!dst_idle) {
-                (void) cudaGetLastError(); // cudaErrorNotReady from the query
                 if (ev_dst == nullptr) {
                     CUDA_CHECK(cudaEventCreateWithFlags(&ev_dst, cudaEventDisableTiming));
                 }
@@ -4871,6 +4889,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_cuda_stage_flush(cuda_ctx);
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    ggml_cuda_set_fresh(cuda_ctx->stream(), true);
 
     GGML_UNUSED(backend);
 }
@@ -9809,17 +9828,9 @@ static void ggml_backend_cuda_keepalive(ggml_backend_t * backends, int n) {
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_cuda_stage_flush((ggml_backend_cuda_context *) backend->context);
     ggml_cuda_keepalive_bump(((ggml_backend_cuda_context *) backend->context)->device);
+    ggml_cuda_set_fresh(((ggml_backend_cuda_context *) backend->context)->stream(), false);
     if (!g_timeline.enabled) {
-        const enum ggml_status st = ggml_backend_cuda_graph_compute_impl(backend, cgraph);
-        ggml_backend_cuda_context * cc = (ggml_backend_cuda_context *) backend->context;
-        if (g_cuda_p2p_dst[cc->device]) {
-            ggml_cuda_set_device(cc->device);
-            if (g_cuda_compute_done[cc->device] == nullptr) {
-                CUDA_CHECK(cudaEventCreateWithFlags(&g_cuda_compute_done[cc->device], cudaEventDisableTiming));
-            }
-            CUDA_CHECK(cudaEventRecord(g_cuda_compute_done[cc->device], cc->stream()));
-        }
-        return st;
+        return ggml_backend_cuda_graph_compute_impl(backend, cgraph);
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_timeline::entry * e;

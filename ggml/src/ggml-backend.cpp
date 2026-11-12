@@ -1883,6 +1883,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             fprintf(stderr, "sched: staging ring wait %.2f ms (slot %d)\n", g_sched_ht.t[0]/1e3, sched->stage_slot);
         }
     }
+    static const bool ev_defer = [] { const char * e = getenv("GGML_SCHED_EVENT_DEFER"); return !e || atoi(e) != 0; }();
+    int pending_ev_backend = -1;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1896,6 +1898,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // previous one, so it may run alongside it (layer split: the two halves of the vocabulary head, LLAMA_HEAD_SPLIT).
         // GGML_SCHED_DISJOINT_NOSYNC=0: always wait
         static const bool disjoint_nosync = [] { const char * e = getenv("GGML_SCHED_DISJOINT_NOSYNC"); return !e || atoi(e) != 0; }();
+        if (split->n_inputs == 0 && pending_ev_backend >= 0) {
+            // this split may wait for the previous split's event below: record it now
+            ggml_backend_event_record(sched->events[pending_ev_backend][sched->cur_copy], sched->backends[pending_ev_backend]);
+            pending_ev_backend = -1;
+        }
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
                 !(disjoint_nosync && sched->bufts[prev_backend_id] != sched->bufts[split_backend_id])) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
@@ -2083,6 +2090,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (pending_ev_backend >= 0) {
+            // the previous split's event, recorded after the copies of its outputs into this split were enqueued on its
+            // stream: a hand-off copy no longer waits behind the event packet (~3-5 us of GPU time per event)
+            ggml_backend_event_record(sched->events[pending_ev_backend][sched->cur_copy], sched->backends[pending_ev_backend]);
+            pending_ev_backend = -1;
+        }
         if (!sched->callback_eval) {
             const double tc0 = ht ? ggml_sched_host_timing::now() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2147,12 +2160,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this split
+        // record the event of this split: deferred until the next split's inputs are copied (GGML_SCHED_EVENT_DEFER=0: now)
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            if (ev_defer) {
+                pending_ev_backend = split_backend_id;
+            } else {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (pending_ev_backend >= 0) {
+        ggml_backend_event_record(sched->events[pending_ev_backend][sched->cur_copy], sched->backends[pending_ev_backend]);
+        pending_ev_backend = -1;
     }
 
     // GGML_SCHED_KEEPALIVE bit 1: with layer split, the first GPU idles with an EMPTY queue while the last stages and the
