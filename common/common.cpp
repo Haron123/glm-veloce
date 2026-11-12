@@ -1556,6 +1556,26 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 llama_token next = tmp[0];
                 llama_decode(lctx, llama_batch_get_one(&next, 1));
             }
+
+            // LLAMA_WARMUP_DECODE (default 3): decode steps at the start of an empty context, so the decode graphs of a
+            // short request are captured (CUDA graphs need two identical calls) before the first request arrives
+            static const int warm_dec = [] { const char * e = getenv("LLAMA_WARMUP_DECODE"); return e ? atoi(e) : 3; }();
+            if (warm_dec > 0 && !llama_model_has_encoder(model)) {
+                llama_memory_clear(llama_get_memory(lctx), true);
+                for (int i = 0; i < warm_dec; ++i) {
+                    llama_token t = tmp[i % tmp.size()];
+                    llama_decode(lctx, llama_batch_get_one(&t, 1));
+                }
+                // two async partial-state snapshots in flight, as the server's context checkpoints of a prompt: their
+                // pinned staging is allocated here and not in the first request (~0.1 s per 112 MiB, Qwen3.8 Flash-Next)
+                const size_t n_st = llama_state_seq_get_size_ext(lctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (n_st > 0) {
+                    std::vector<uint8_t> st0(n_st), st1(n_st);
+                    llama_state_seq_get_data_ext(lctx, st0.data(), n_st, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+                    llama_state_seq_get_data_ext(lctx, st1.data(), n_st, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+                    llama_synchronize(lctx);
+                }
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);

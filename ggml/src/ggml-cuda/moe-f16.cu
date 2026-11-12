@@ -1111,8 +1111,10 @@ void ggml_cuda_hc_combine_norm(ggml_backend_cuda_context & ctx, ggml_tensor * po
 // Decode / verify (< 16 tokens): one block per token as in hc_combine_norm, but 1024 threads (256 per stream, each
 // with ~2.5 float4) instead of 256 threads with 10 dependent float4 each (at 1 token that single block lost to the
 // separate combine and norm kernels). Same read-before-barrier order, so the same aliasing rules. Saves the norm launch.
-template <bool RAWP>
-__launch_bounds__(1024)
+// NS = 1: one block per (stream, token), 4x the blocks for the same per-stream sums (bit-identical); only when xn
+// overlaps no input that another stream's block reads
+template <bool RAWP, int NS = 4>
+__launch_bounds__(256*NS)
 static __global__ void hc_combine_norm_dec(
         const float * __restrict__ residual, const float * __restrict__ bo, const float * __restrict__ post,
         const float * __restrict__ w, float * __restrict__ x_out, float * __restrict__ xn_out,
@@ -1121,8 +1123,9 @@ static __global__ void hc_combine_norm_dec(
         block_q8_1 * __restrict__ xq, const int64_t s_xq) {
     constexpr int MAXV = 4; // float4 per thread: n_embd <= 4096
     constexpr int GW   = 256/WARP_SIZE; // warps per stream
-    const int64_t t = blockIdx.x;
-    const int s   = threadIdx.x / 256;
+    const int64_t t = NS == 4 ? blockIdx.x : blockIdx.x / 4;
+    const int s   = NS == 4 ? threadIdx.x / 256 : blockIdx.x % 4;
+    const int sl  = NS == 4 ? s : 0; // the stream's slot in red
     const int tid = threadIdx.x % 256;
     const int sv4 = n_embd/4;
     float p = post[s*sp0 + t*sp1];
@@ -1131,12 +1134,15 @@ static __global__ void hc_combine_norm_dec(
     }
     const float4 * rp = (const float4 *) (residual + t*s_res + (int64_t) s*n_embd);
     const float4 * bp = (const float4 *) (bo + t*s_bo);
+    const float4 * wp = (const float4 *) (w + (int64_t) s*n_embd);
     float4 v[MAXV];
+    float4 gv[MAXV]; // the norm weight never overlaps an output: load it with the rest, one memory round trip fewer
     float ss = 0.0f;
 #pragma unroll
     for (int k = 0; k < MAXV; ++k) {
         const int j = tid + k*256;
         if (j < sv4) {
+            gv[k] = wp[j];
             float4 a = rp[j];
             const float4 b = bp[j];
             a.x += b.x*p; a.y += b.y*p; a.z += b.z*p; a.w += b.w*p;
@@ -1144,19 +1150,18 @@ static __global__ void hc_combine_norm_dec(
             ss += a.x*a.x + a.y*a.y + a.z*a.z + a.w*a.w;
         }
     }
-    __shared__ float red[4*GW];
+    __shared__ float red[NS*GW];
     ss = warp_reduce_sum(ss);
     if (tid % WARP_SIZE == 0) {
-        red[s*GW + tid / WARP_SIZE] = ss;
+        red[sl*GW + tid / WARP_SIZE] = ss;
     }
     __syncthreads(); // every input except w has been read by the whole block
     float tot = 0.0f;
 #pragma unroll
     for (int i = 0; i < GW; ++i) {
-        tot += red[s*GW + i];
+        tot += red[sl*GW + i];
     }
     const float r = rsqrtf(tot/n_embd + eps);
-    const float4 * wp = (const float4 *) (w + (int64_t) s*n_embd);
     float4 * xp = (float4 *) (x_out + t*s_x + (int64_t) s*n_embd);
     float4 * op = (float4 *) (xn_out + t*s_xn + (int64_t) s*n_embd);
 #pragma unroll
@@ -1164,7 +1169,7 @@ static __global__ void hc_combine_norm_dec(
         const int j = tid + k*256;
         if (j < sv4) {
             xp[j] = v[k];
-            const float4 g = wp[j];
+            const float4 g = gv[k];
             const float4 o = make_float4(v[k].x*r*g.x, v[k].y*r*g.y, v[k].z*r*g.z, v[k].w*r*g.w);
             op[j] = o;
             if (xq) {
@@ -1221,7 +1226,16 @@ void ggml_cuda_hc_combine_norm_dec(ggml_backend_cuda_context & ctx, ggml_tensor 
     const ggml_tensor * w  = mul->src[0] == rms ? mul->src[1] : mul->src[0];
     const ggml_tensor * bo = post_node->src[0];
     const ggml_tensor * pw = raw_post ? raw_post : post_node->src[2];
-    (raw_post ? hc_combine_norm_dec<true> : hc_combine_norm_dec<false>)<<<(unsigned) x->ne[2], 1024, 0, ctx.stream()>>>(
+    const ggml_tensor * res = post_node->src[1];
+    // one block per stream when xn overlaps nothing another stream's block reads (it may exactly replace the residual)
+    static const bool split_env = [] { const char * e = getenv("GGML_HC_COMBINE_NORM_SPLIT"); return !e || atoi(e) != 0; }();
+    const bool xn_on_res = mul->data == res->data && ggml_are_same_shape(mul, res) && ggml_are_same_stride(mul, res);
+    const bool split = split_env && !hc_ranges_overlap(mul, bo) && !hc_ranges_overlap(mul, pw) &&
+        (!hc_ranges_overlap(mul, res) || xn_on_res);
+    const unsigned nb = split ? 4*(unsigned) x->ne[2] : (unsigned) x->ne[2];
+    auto kern = split ? (raw_post ? hc_combine_norm_dec<true, 1> : hc_combine_norm_dec<false, 1>) :
+                        (raw_post ? hc_combine_norm_dec<true, 4> : hc_combine_norm_dec<false, 4>);
+    kern<<<nb, split ? 256 : 1024, 0, ctx.stream()>>>(
         (const float *) post_node->src[1]->data, (const float *) bo->data, (const float *) pw->data,
         (const float *) w->data, (float *) post_node->data, (float *) mul->data,
         (int) x->ne[0], post_node->src[1]->nb[2]/sizeof(float), bo->nb[1]/sizeof(float), pw->nb[0]/sizeof(float),

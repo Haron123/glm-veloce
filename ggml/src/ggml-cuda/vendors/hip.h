@@ -87,6 +87,11 @@
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
+#define cudaIpcCloseMemHandle hipIpcCloseMemHandle
+#define cudaIpcGetMemHandle hipIpcGetMemHandle
+#define cudaIpcMemHandle_t hipIpcMemHandle_t
+#define cudaIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
+#define cudaIpcOpenMemHandle hipIpcOpenMemHandle
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc

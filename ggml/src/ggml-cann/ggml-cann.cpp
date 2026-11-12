@@ -2756,6 +2756,7 @@ static const ggml_backend_i ggml_backend_cann_interface = {
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ ggml_backend_cann_cpy_tensor_async,
+    /* .stage_host_input        = */ NULL,
     /* .synchronize             = */ ggml_backend_cann_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,

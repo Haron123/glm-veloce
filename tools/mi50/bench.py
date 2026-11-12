@@ -45,7 +45,7 @@ def post(port, path, payload, timeout=600):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def bench_one(port, category, prompt, max_tokens):
+def bench_one(port, category, prompt, max_tokens, samp=None):
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
@@ -54,6 +54,7 @@ def bench_one(port, category, prompt, max_tokens):
         "cache_prompt": False,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    payload.update(samp or {})
     t0 = time.perf_counter()
     ttft = None
     tokens = 0
@@ -109,14 +110,17 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--repeat", type=int, default=1, help="times to run the whole set (first is warmup if --warmup)")
     ap.add_argument("--warmup", action="store_true", help="run the set once first and discard")
+    ap.add_argument("--sampling", default=None,
+                    help="json merged into the request, e.g. '{\"temperature\":0.6,\"top_k\":20,\"top_p\":0.95}'")
     args = ap.parse_args()
+    samp = json.loads(args.sampling) if args.sampling else None
 
     os.makedirs(args.out, exist_ok=True)
 
     def run_set(tag):
         results = []
         for category, prompt in PROMPTS:
-            r = bench_one(args.port, category, prompt, args.max_tokens)
+            r = bench_one(args.port, category, prompt, args.max_tokens, samp)
             if r is None:
                 print(f"FAILED: {category}: {prompt[:50]}", file=sys.stderr)
                 sys.exit(1)

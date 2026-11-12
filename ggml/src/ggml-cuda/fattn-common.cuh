@@ -1225,6 +1225,15 @@ void launch_fattn(
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
         }
     }
+    {
+        static int fa_dbg = [] { const char * e = getenv("GGML_CUDA_FA_LAUNCH_DEBUG"); return e ? atoi(e) : 0; }();
+        if (fa_dbg > 0) {
+            fa_dbg--;
+            fprintf(stderr, "fa launch: n_kv %lld ntiles_KV %d nbatch_fa %d grid (%u,%u,%u) block (%u,%u) occ %d parallel_blocks %d stream_k %d\n",
+                (long long) n_kv, ntiles_KV, nbatch_fa, blocks_num.x, blocks_num.y, blocks_num.z, block_dim.x, block_dim.y,
+                max_blocks_per_sm, parallel_blocks, (int) stream_k);
+        }
+    }
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;

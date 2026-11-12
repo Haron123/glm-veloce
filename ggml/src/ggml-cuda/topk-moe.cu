@@ -1,6 +1,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "topk-moe.cuh"
+#include "mmvq.cuh"
 
 #include <cmath>
 #include <initializer_list>
@@ -624,13 +625,18 @@ template <int ctrl> static __device__ __forceinline__ uint32_t router1_dpp(const
 // NT tokens (1..4, XLDS only): the weight words stay in registers, each token is staged in LDS in turn and gated into its
 // own scratch rows; the last workgroup runs one top-k wave per token (GLM-5.3's 2-token MTP verify ran the f32 router
 // matvec and the top-k as two launches)
-template <int E, int NI, bool XLDS, int WEPW, bool F32W = false, bool SIGMOID = false, bool F16W = false, int NT = 1> // NI: 16-byte chunks per lane and row
+// SMAX: softmax gating (Qwen3.8 Flash-Next: 512 experts, no selection bias): the workgroups store the raw logits as the
+// probabilities and keys, the top-k wave takes the max and the sum over all experts and turns the picks into the softmax
+// values (the same selection: softmax is monotonic)
+template <int E, int NI, bool XLDS, int WEPW, bool F32W = false, bool SIGMOID = false, bool F16W = false, int NT = 1,
+          bool SMAX = false> // NI: 16-byte chunks per lane and row
 static __global__ void __launch_bounds__(256) router1_topk_bf16(
         const char * __restrict__ W, const float * __restrict__ x, const float * __restrict__ bias,
         float * __restrict__ weights, int32_t * __restrict__ ids, float * __restrict__ scratch, int * __restrict__ counter,
         const int K, const int64_t s_row, const int n_used, const float clamp_val, const float scale_val,
-        const int64_t sx_tok, const int64_t s_ids_tok, const int64_t s_w_tok) {
+        const int64_t sx_tok, const int64_t s_ids_tok, const int64_t s_w_tok, block_q8_1 * __restrict__ xq, const int nq8) {
     static_assert(NT >= 1 && NT <= 4 && (NT == 1 || XLDS), "several tokens: XLDS, one top-k wave per token");
+    static_assert(!SMAX || E % 64 == 0, "softmax: the max and sum take every lane's values");
     constexpr int PW = 64;
     const int tid  = threadIdx.x;
     const int lane = tid % PW;
@@ -675,6 +681,21 @@ static __global__ void __launch_bounds__(256) router1_topk_bf16(
             w4[r][i] = ok ? *(const uint4 *) (W + (int64_t) (e0 + r)*s_row + 16*c) : make_uint4(0, 0, 0, 0);
         }
     }
+    // the q8_1 copy of the token for the expert matvecs (one token; xq: the q8 cache entry the launcher registered), while
+    // the weight words are in flight: each 32-lane half of wave 0 quantizes one block exactly as quantize_q8_1 does
+    if (NT == 1 && xq != nullptr && wv == 0) {
+        for (int b = blockIdx.x + (lane/QK8_1)*gridDim.x; b < nq8; b += 2*gridDim.x) {
+            const int   k    = b*QK8_1 + lane % QK8_1;
+            const float xi   = k < K ? x[k] : 0.0f;
+            const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+            const float sum  = warp_reduce_sum<QK8_1>(xi);
+            const float d    = amax / 127.0f;
+            xq[b].qs[lane % QK8_1] = amax == 0.0f ? 0 : (int8_t) roundf(xi / d);
+            if (lane % QK8_1 == 0) {
+                xq[b].ds = make_half2(d, sum);
+            }
+        }
+    }
     if (XLDS) {
 #pragma unroll
         for (int j = 0; j < NX4; ++j) {
@@ -686,7 +707,7 @@ static __global__ void __launch_bounds__(256) router1_topk_bf16(
         __asm__ volatile("s_waitcnt lgkmcnt(0)\n s_barrier" ::: "memory"); // LDS only: the weight words stay in flight
     }
     float bl = 0.0f;                         // the bias of this lane's expert (lanes 0..EPW-1)
-    if (lane < EPW) {
+    if (!SMAX && lane < EPW) {
         bl = bias[e0 + lane];
     }
     for (int t = 0; t < NT; ++t) {
@@ -763,7 +784,7 @@ static __global__ void __launch_bounds__(256) router1_topk_bf16(
             for (int r = 1; r < EPW; ++r) {
                 l = lane == r ? acc[r] : l;
             }
-            const float    pv = SIGMOID ? 1.0f/(1.0f + expf(-l)) : sqrtf(l > 20.0f ? l : logf(1.0f + expf(l)));
+            const float    pv = SMAX ? l : SIGMOID ? 1.0f/(1.0f + expf(-l)) : sqrtf(l > 20.0f ? l : logf(1.0f + expf(l)));
             const uint32_t u  = __float_as_uint((pv + bl) + 0.0f); // -0 -> +0: equal values, equal keys
             probs[e0 + lane] = pv;
             keys[e0 + lane]  = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -793,6 +814,25 @@ static __global__ void __launch_bounds__(256) router1_topk_bf16(
         const bool ok = E % PW == 0 || e < E;
         p[k]   = ok ? probs[min(e, E - 1)] : 0.0f;
         key[k] = ok ? keys[min(e, E - 1)]  : 0u;
+    }
+    // softmax: the max and the sum over all experts (p holds the logits)
+    float smax_m = 0.0f;
+    float smax_inv = 1.0f;
+    if constexpr (SMAX) {
+        float m = p[0];
+#pragma unroll
+        for (int kk = 1; kk < NPL; ++kk) {
+            m = fmaxf(m, p[kk]);
+        }
+        m = warp_reduce_max<PW>(m);
+        float sum = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < NPL; ++kk) {
+            sum += expf(p[kk] - m);
+        }
+        sum = warp_reduce_sum<PW>(sum);
+        smax_m   = m;
+        smax_inv = 1.0f/sum;
     }
     float wsum = 0.0f;
     float wsel = 0.0f; // this lane's weight if it wrote ids[k] for its k == lane
@@ -832,7 +872,8 @@ static __global__ void __launch_bounds__(256) router1_topk_bf16(
         for (int kk = 1; kk < NPL; ++kk) {
             pb = kk == bkk ? p[kk] : pb;
         }
-        const float best_p = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(pb), wl));
+        const float best_l = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(pb), wl));
+        const float best_p = SMAX ? expf(best_l - smax_m)*smax_inv : best_l;
         if (lane == wl) {
 #pragma unroll
             for (int kk = 0; kk < NPL; ++kk) {
@@ -856,7 +897,7 @@ static __global__ void __launch_bounds__(256) router1_topk_bf16(
 }
 
 // bf16 [K <= 8192, 384] with sqrt(softplus) gating (DeepSeek V4.1) or f32 [K <= 4096, 288] with sigmoid gating (GLM-5-Next)
-bool ggml_cuda_router1_supported(const ggml_tensor * mm, int n_used, bool sigmoid) {
+bool ggml_cuda_router1_supported(const ggml_tensor * mm, int n_used, bool sigmoid, bool softmax) {
     const ggml_tensor * W = mm->src[0];
     const ggml_tensor * x = mm->src[1];
     // GGML_CUDA_ROUTER1_F16=1 (opt-in): DeepSeek V4 Flash's f16 router (256 experts) in this fused kernel at one token
@@ -864,6 +905,18 @@ bool ggml_cuda_router1_supported(const ggml_tensor * mm, int n_used, bool sigmoi
     // route differently from its 6-token verify batches and greedy DSpark runs drafted worse on all 6 prompts tried (prose
     // 62.6 -> 44.4 t/s, story 45.5 -> 40.3); run-ds4-flash.sh sets it for NO_SPEC=1 only
     static const bool f16_env = [] { const char * e = getenv("GGML_CUDA_ROUTER1_F16"); return e && atoi(e) != 0; }();
+    // softmax: Qwen3.8 Flash-Next's bf16 router, 512 experts (GGML_CUDA_ROUTER1_SMAX=0 off)
+    static const bool smax_env = [] { const char * e = getenv("GGML_CUDA_ROUTER1_SMAX"); return !e || atoi(e) != 0; }();
+    // GGML_CUDA_ROUTER1_SMAX_NT: 2..4 tokens (the MTP verify) too, each token with the one-token arithmetic
+    static const bool smax_nt_env = [] { const char * e = getenv("GGML_CUDA_ROUTER1_SMAX_NT"); return e && atoi(e) != 0; }();
+    if (softmax) {
+        const bool smax_tok_ok = x->ne[1] == 1 || (smax_nt_env && x->ne[1] <= 4 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[1] % 16 == 0);
+        return smax_env && !sigmoid && W->type == GGML_TYPE_BF16 && W->ne[1] == 512 && W->ne[0] % 8 == 0 && W->ne[0] <= 8192 &&
+            x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && smax_tok_ok &&
+            W->ne[2] == 1 && W->ne[3] == 1 && W->nb[1] % 16 == 0 && ((uintptr_t) W->data) % 16 == 0 &&
+            x->nb[0] == sizeof(float) && ((uintptr_t) x->data) % 16 == 0 &&
+            n_used >= 1 && n_used <= 64 && GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    }
     const bool combo = (!sigmoid && W->type == GGML_TYPE_BF16 && W->ne[1] == 384 && W->ne[0] % 8 == 0 && W->ne[0] <= 8192) ||
                        (!sigmoid && f16_env && W->type == GGML_TYPE_F16 && W->ne[1] == 256 && W->ne[0] % 8 == 0 && W->ne[0] <= 8192) ||
                        ( sigmoid && W->type == GGML_TYPE_F32  && W->ne[1] == 288 && W->ne[0] % 4 == 0 && W->ne[0] <= 4096);
@@ -879,7 +932,7 @@ bool ggml_cuda_router1_supported(const ggml_tensor * mm, int n_used, bool sigmoi
 
 void ggml_cuda_router1_topk(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * weights, ggml_tensor * ids,
                             const ggml_tensor * bias, float clamp_val, float scale_val, bool sigmoid, int n_tok,
-                            int64_t s_ids_tok, int64_t s_w_tok) {
+                            int64_t s_ids_tok, int64_t s_w_tok, bool softmax) {
     const ggml_tensor * W = mm->src[0];
     const ggml_tensor * x = mm->src[1];
     const int E = (int) W->ne[1];
@@ -894,23 +947,55 @@ void ggml_cuda_router1_topk(ggml_backend_cuda_context & ctx, const ggml_tensor *
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), 2*E*n_tok);
     const int64_t sx_tok = x->nb[1]/sizeof(float);
     const bool f16w = W->type == GGML_TYPE_F16;
-    GGML_ASSERT(sigmoid ? E == 288 : f16w ? E == 256 : E == 384);
+    GGML_ASSERT(softmax ? E == 512 && bias == nullptr : sigmoid ? E == 288 : f16w ? E == 256 : E == 384);
     static const bool xlds_env = [] { const char * e = getenv("GGML_CUDA_ROUTER1_XLDS"); return !e || atoi(e) != 0; }();
     const bool xlds = xlds_env || n_tok > 1;
     static const int  wepw = [] { const char * e = getenv("GGML_CUDA_ROUTER1_EPW"); return e ? atoi(e) : 4; }();
+    // one token: the router also writes the q8_1 copy of its input into the q8 cache, where the expert (and shared
+    // expert) matvecs look it up, unless a copy exists already (one quantize launch less per MoE layer;
+    // GGML_CUDA_ROUTER1_Q8=0 off). Needs the type-independent cache (GGML_CUDA_Q8_CACHE_ANYTYPE, the default)
+    static const bool q8_env = [] {
+        const char * e = getenv("GGML_CUDA_ROUTER1_Q8");    const bool on  = !e || atoi(e) != 0;
+        const char * c = getenv("GGML_CUDA_Q8_CACHE");      const bool qc  = !c || atoi(c) != 0;
+        const char * a = getenv("GGML_CUDA_Q8_CACHE_ANYTYPE"); const bool any = !a || atoi(a) != 0;
+        return on && qc && any;
+    }();
+    block_q8_1 * xq = nullptr;
+    int nq8 = 0;
+    if (q8_env && n_tok == 1 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && ggml_is_contiguous(x)) {
+        const int64_t K_pad = GGML_PAD(K, MATRIX_ROW_PADDING);
+        const ggml_tensor * key = ggml_cuda_q8_cache_key(x);
+        bool have = false;
+        for (const auto & e : ctx.q8_cache) {
+            have = have || (e.t == key && e.ne[0] == K_pad && e.ne[1] == 1 && e.ne[2] == 1 && e.ne[3] == 1);
+        }
+        if (!have) {
+            ctx.q8_cache.push_back({ key, (int) GGML_TYPE_Q8_0, { K_pad, 1, 1, 1 },
+                                     std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), (size_t) K_pad/QK8_1*sizeof(block_q8_1)) });
+            xq  = (block_q8_1 *) ctx.q8_cache.back().buf->get();
+            nq8 = (int) (K_pad/QK8_1);
+        }
+    }
 #define ROUTER1_LAUNCH(NI) do { \
         if (wepw == 4) { if (xlds) { ROUTER1_LAUNCH_X(NI, true, 4); } else { ROUTER1_LAUNCH_X(NI, false, 4); } } \
         else           { if (xlds) { ROUTER1_LAUNCH_X(NI, true, 8); } else { ROUTER1_LAUNCH_X(NI, false, 8); } } } while (0)
-#define ROUTER1_LAUNCH_X(NI, XL, EW) do { if (sigmoid) { ROUTER1_LAUNCH_T(288, NI, XL, EW, true, true, false); } \
+#define ROUTER1_LAUNCH_X(NI, XL, EW) do { if (softmax) { if (XL) { switch (n_tok) { \
+        case 2: ROUTER1_LAUNCH_N(512, NI, true, EW, false, false, false, 2, true); break; \
+        case 3: ROUTER1_LAUNCH_N(512, NI, true, EW, false, false, false, 3, true); break; \
+        case 4: ROUTER1_LAUNCH_N(512, NI, true, EW, false, false, false, 4, true); break; \
+        default: ROUTER1_LAUNCH_N(512, NI, true, EW, false, false, false, 1, true); break; } } \
+        else { ROUTER1_LAUNCH_N(512, NI, false, EW, false, false, false, 1, true); } } \
+                                         else if (sigmoid) { ROUTER1_LAUNCH_T(288, NI, XL, EW, true, true, false); } \
                                          else if (f16w) { ROUTER1_LAUNCH_T(256, NI, XL, EW, false, false, true); } \
                                          else         { ROUTER1_LAUNCH_T(384, NI, XL, EW, false, false, false); } } while (0)
 #define ROUTER1_LAUNCH_T(EE, NI, XL, EW, FW, SG, HW) do { if (XL) { switch (n_tok) { \
-        case 2: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 2); break; case 3: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 3); break; \
-        case 4: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 4); break; default: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 1); break; } } \
-        else { ROUTER1_LAUNCH_N(EE, NI, false, EW, FW, SG, HW, 1); } } while (0)
-#define ROUTER1_LAUNCH_N(EE, NI, XL, EW, FW, SG, HW, NT_) router1_topk_bf16<EE, NI, XL, EW, FW, SG, HW, NT_><<<(EE)/(EW), 256, 0, stream>>>( \
-        (const char *) W->data, (const float *) x->data, (const float *) bias->data, (float *) weights->data, \
-        (int32_t *) ids->data, scratch.get(), ctx.router1_counter, K, W->nb[1], n_used, clamp_val, scale_val, sx_tok, s_ids_tok, s_w_tok)
+        case 2: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 2, false); break; case 3: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 3, false); break; \
+        case 4: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 4, false); break; default: ROUTER1_LAUNCH_N(EE, NI, true, EW, FW, SG, HW, 1, false); break; } } \
+        else { ROUTER1_LAUNCH_N(EE, NI, false, EW, FW, SG, HW, 1, false); } } while (0)
+#define ROUTER1_LAUNCH_N(EE, NI, XL, EW, FW, SG, HW, NT_, SM) router1_topk_bf16<EE, NI, XL, EW, FW, SG, HW, NT_, SM><<<(EE)/(EW), 256, 0, stream>>>( \
+        (const char *) W->data, (const float *) x->data, bias ? (const float *) bias->data : nullptr, (float *) weights->data, \
+        (int32_t *) ids->data, scratch.get(), ctx.router1_counter, K, W->nb[1], n_used, clamp_val, scale_val, sx_tok, s_ids_tok, s_w_tok, \
+        NT_ == 1 ? xq : nullptr, nq8)
     // chunks per row: K/8 (bf16) or K/4 (f32), 64 lanes
     const int kc = sigmoid ? 2*K : K; // bf16-equivalent K for the NI choice
     if (kc <= 1024) {

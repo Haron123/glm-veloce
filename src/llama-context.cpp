@@ -857,12 +857,25 @@ void llama_context::sched_reserve() {
 // -> decode return
 struct llama_token_timing {
     bool on = [] { const char * e = getenv("LLAMA_TOKEN_TIMING"); return e && atoi(e) != 0; }();
+    int each = [] { const char * e = getenv("LLAMA_TOKEN_TIMING"); return e ? atoi(e) : 0; }();
     int64_t t_sync_end = 0, t_entry = 0, t_inputs = 0, t_comp = 0;
     double a_gap = 0, a_prep = 0, a_comp = 0, a_post = 0; int n = 0;
     // phase marks inside decode: 0 entry, 1 balloc init, 2 sched_reserve+memory_update, 3 memory init_batch,
     // 4 output_reserve, 5 process_ubatch before set_inputs, 6 set_inputs done
     int64_t mk[8] = {}; double am[8] = {};
-    void mark(int k) { if (on) { mk[k] = ggml_time_us(); } }
+    void mark(int k) {
+        if (on) { mk[k] = ggml_time_us(); }
+        // =2 debug: per token, print any phase longer than 200 us together with its marks
+        if (on && each >= 2 && k == 6) {
+            int64_t worst = 0; int wk = 0;
+            for (int q = 1; q <= 6; ++q) { if (mk[q] && mk[q-1]) { int64_t d = mk[q]-mk[q-1]; if (d > worst) { worst = d; wk = q; } } }
+            if (worst > 200) {
+                fprintf(stderr, "tok mark: balloc %.3f reserve+mem_update %.3f init_batch %.3f out_reserve %.3f pre_inputs %.3f set_inputs %.3f ms\n",
+                    (mk[1]-mk[0])/1e3, (mk[2]-mk[1])/1e3, (mk[3]-mk[2])/1e3, (mk[4]-mk[3])/1e3, (mk[5]-mk[4])/1e3, (mk[6]-mk[5])/1e3);
+                GGML_UNUSED(wk);
+            }
+        }
+    }
     void report() {
         for (int k = 1; k <= 6; ++k) { if (mk[k] && mk[k-1]) { am[k] += mk[k] - mk[k-1]; } }
         memset(mk, 0, sizeof(mk));
@@ -2225,7 +2238,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                if (t_logits->ne[0] < n_vocab) {
+                if (res->t_logits_lo != nullptr) {
+                    // LLAMA_HEAD_SPLIT: the first rows from the first device, the rest from the last one
+                    ggml_tensor * t_lo = res->t_logits_lo;
+                    ggml_backend_t backend_lo = ggml_backend_sched_get_tensor_backend(sched.get(), t_lo);
+                    GGML_ASSERT(backend_lo != nullptr);
+                    const int64_t n_lo = t_lo->ne[0], n_hi = t_logits->ne[0];
+                    GGML_ASSERT(n_lo + n_hi == n_vocab && t_lo->nb[1] == (size_t) n_lo*sizeof(float) && t_logits->nb[1] == (size_t) n_hi*sizeof(float));
+                    for (int64_t r = 0; r < n_outputs; ++r) {
+                        ggml_backend_tensor_get_async(backend_lo,  t_lo,     logits_out + r*n_vocab,        r*n_lo*sizeof(float), n_lo*sizeof(float));
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + r*n_vocab + n_lo, r*n_hi*sizeof(float), n_hi*sizeof(float));
+                    }
+                } else if (t_logits->ne[0] < n_vocab) {
                     // a reduced-vocabulary head (MTP draft vocabulary): the first ne[0] ids per row, the rest -inf
                     const int64_t nv = t_logits->ne[0];
                     GGML_ASSERT(t_logits->nb[1] == (size_t) nv*sizeof(float));
@@ -2946,6 +2970,22 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
+        // LLAMA_HEAD_SPLIT draft head: pin the first-device boundary op and the join to the devices of their weights
+        if (il == -1 && (strcmp(name, "result_output_lo_pin") == 0 || strcmp(name, "result_output_cat_pin") == 0)) {
+            const bool lo_pin = name[14] == 'l';
+            const ggml_tensor * mm = lo_pin ? cur->src[0] : cur->src[1];
+            const ggml_tensor * w  = mm ? mm->src[0] : nullptr;
+            const ggml_backend_buffer_t wb = w ? (w->view_src ? w->view_src->buffer : w->buffer) : nullptr;
+            if (wb != nullptr) {
+                for (const auto & backend : backends) {
+                    if (ggml_backend_get_default_buffer_type(backend.get()) == ggml_backend_buffer_get_type(wb) &&
+                            ggml_backend_supports_op(backend.get(), cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                        break;
+                    }
+                }
+            }
+        }
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
@@ -4843,6 +4883,14 @@ int32_t llama_decode(
     }
     if (g_tok_t.on && batch.n_tokens == 1 && g_tok_t.t_sync_end > 0 && g_tok_t.t_inputs >= t_entry) {
         const int64_t t_ret = ggml_time_us();
+        static const bool each = [] { const char * e = getenv("LLAMA_TOKEN_TIMING"); return e && atoi(e) >= 2; }();
+        if (each) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const double mono = ts.tv_sec*1e3 + ts.tv_nsec/1e6 - (ggml_time_us() - t_entry)/1e3; // mono ms at decode entry
+            fprintf(stderr, "tok: entry mono %.3f ms | prev sync end %+.3f, inputs %+.3f, comp ret %+.3f, ret %+.3f ms\n", mono,
+                (g_tok_t.t_sync_end - t_entry)/1e3, (g_tok_t.t_inputs - t_entry)/1e3, (g_tok_t.t_comp - t_entry)/1e3, (t_ret - t_entry)/1e3);
+        }
         g_tok_t.a_gap  += t_entry - g_tok_t.t_sync_end;
         g_tok_t.a_prep += g_tok_t.t_inputs - t_entry;
         g_tok_t.a_comp += g_tok_t.t_comp - g_tok_t.t_inputs;

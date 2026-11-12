@@ -406,6 +406,18 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // weight keeper support: build a meta buffer for the tensors of ctx from per-device buffers supplied by get_simple
+    // (NULL from it: nothing allocated, NULL returned), and access a meta buffer's device buffers / their tensor contexts
+    typedef ggml_backend_buffer_t (*ggml_backend_meta_simple_buffer_fn)(size_t i, struct ggml_context * simple_ctx,
+        ggml_backend_buffer_type_t simple_buft, void * ud);
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_with(struct ggml_context * ctx, ggml_backend_buffer_type_t buft,
+        ggml_backend_meta_simple_buffer_fn get_simple, void * ud);
+    GGML_API bool                  ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft);
+    GGML_API bool                  ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+    GGML_API size_t                ggml_backend_meta_buffer_n_simple(ggml_backend_buffer_t buf);
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_get_simple(ggml_backend_buffer_t buf, size_t i);
+    GGML_API struct ggml_context * ggml_backend_meta_buffer_get_simple_ctx(ggml_backend_buffer_t buf, size_t i);
+
     //
     // Utils
     //

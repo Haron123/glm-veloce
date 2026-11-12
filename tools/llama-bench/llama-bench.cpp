@@ -2196,6 +2196,35 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
+    // LLAMA_BENCH_TG_BATCH=N (N > 1): decode N tokens per step with logits for all of them (the shape of an MTP verify
+    // with N - 1 drafts); t/s counts tokens, so N / (t/s) is the step time
+    static const int tg_batch = [] { const char * e = getenv("LLAMA_BENCH_TG_BATCH"); return e ? std::max(1, atoi(e)) : 1; }();
+    if (tg_batch > 1) {
+        llama_batch b = llama_batch_init(tg_batch, 0, 1);
+        llama_memory_t mem = llama_get_memory(ctx);
+        for (int i = 0; i < n_gen; i += tg_batch) {
+            const int n = std::min(tg_batch, n_gen - i);
+            const llama_pos p0 = llama_memory_seq_pos_max(mem, 0) + 1;
+            b.n_tokens = n;
+            for (int j = 0; j < n; ++j) {
+                b.token[j]     = std::rand() % n_vocab;
+                b.pos[j]       = p0 + j;
+                b.n_seq_id[j]  = 1;
+                b.seq_id[j][0] = 0;
+                b.logits[j]    = 1;
+            }
+            const int res = llama_decode(ctx, b);
+            if (res != 0) {
+                fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
+                llama_batch_free(b);
+                return false;
+            }
+            llama_synchronize(ctx);
+        }
+        llama_batch_free(b);
+        return true;
+    }
+
     for (int i = 0; i < n_gen; i++) {
         int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
         if (res != 0) {
@@ -2256,6 +2285,12 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+
+    // LLAMA_BENCH_SEED=<n>: seed the random tg tokens; without it every process generates the same tokens, so data
+    // that depends on the tokens (e.g. an mmapped embedding table) is already cached after the first run
+    if (const char * e = getenv("LLAMA_BENCH_SEED")) {
+        std::srand((unsigned) atoi(e));
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {

@@ -74,7 +74,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        if (tokens->buffer != nullptr) { // unallocated when no node reads it (host gather without the get_rows branch)
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
 
         if (tok_embd_host) {
             GGML_ASSERT(n_embd == tok_embd_host->ne[0] && n_embd == embd->ne[0]);
@@ -1366,6 +1368,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_lo   = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1426,6 +1429,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_logits_lo != nullptr) {
+        ggml_set_output(t_logits_lo);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -2504,7 +2510,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(ggml_are_same_shape (inps[0], inps[1]));
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token && !inp->tok_embd_host ? 0 : 1);
+    // host gather: the get_rows branch is never selected, but as a graph node it still formed a CPU split before the
+    // first GPU stage (~40 us of CPU-backend graph compute per decode token on the critical path); leave it out
+    // (LLAMA_EMBD_HOST_NOSEL=0: keep the select)
+    static const bool nosel = [] { const char * e = getenv("LLAMA_EMBD_HOST_NOSEL"); return !e || atoi(e) != 0; }();
+    ggml_tensor * cur = inp->tok_embd_host && nosel ? inps[1] :
+        ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token && !inp->tok_embd_host ? 0 : 1);
 
     if (n_embd_inp != n_embd) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);

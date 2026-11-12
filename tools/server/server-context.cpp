@@ -2368,6 +2368,15 @@ private:
             }
         }
 
+        // the host buffer of an erased checkpoint is reused by the new one: a fresh one is zero-filled and page-faulted
+        // in (a 112 MiB recurrent state cost ~80 ms per checkpoint). Its captures are complete (see at_risk above)
+        std::vector<uint8_t> reuse_tgt;
+        const auto keep_buffer = [&reuse_tgt](common_prompt_checkpoint & c) {
+            if (c.data_tgt.capacity() > reuse_tgt.capacity()) {
+                reuse_tgt = std::move(c.data_tgt);
+            }
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2379,6 +2388,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                keep_buffer(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2389,11 +2399,12 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            keep_buffer(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2403,6 +2414,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    keep_buffer(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2412,7 +2424,8 @@ private:
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
-        cur.id_task = id_task;
+        cur.id_task  = id_task;
+        cur.data_tgt = std::move(reuse_tgt);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3644,12 +3657,18 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // break at the last user message, or at user messages at least min step past the last checkpoint.
+                        // not within a few tokens of this batch's start, which gets its own checkpoint before decode: a
+                        // follow-up turn starts its user message 2 tokens past the cached prefix, and the extra small
+                        // decode (an uncaptured graph, ~80 ms on 2x MI50) bought a checkpoint no better than that one
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            const bool near_start = pos < (int64_t) slot.task->n_tokens() - rem_start + 16;
+
+                            if (!near_start && (pos == last_user_pos || checkpoints.empty() ||
+                                    pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }

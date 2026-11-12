@@ -19,6 +19,10 @@ void ggml_cuda_op_mul_mat_vec_q(
 
 // q8_1 copy of a matmul activation, shared per graph through ctx.q8_cache (see mmvq.cu)
 extern thread_local bool ggml_cuda_q8_cache_bypass;
+// the tensor a q8 cache entry is keyed on: contiguous full-size reshapes resolve to their base, so a producer that
+// writes the q8_1 copy of its output must register it under this key for the consumer's lookup to find it
+const ggml_tensor * ggml_cuda_q8_cache_key(const ggml_tensor * t);
+
 char * ggml_cuda_q8_1_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_w,
                                  int64_t ne10_padded, ggml_cuda_pool_alloc<char> & local);
 

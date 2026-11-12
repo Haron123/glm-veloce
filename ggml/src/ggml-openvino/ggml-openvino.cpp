@@ -808,6 +808,7 @@ static const ggml_backend_i ggml_backend_openvino_interface = {
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
+    /* .stage_host_input        = */ NULL,
     /* .synchronize             = */ NULL,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,

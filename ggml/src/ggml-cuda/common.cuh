@@ -1469,6 +1469,23 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * hcp_shexp_node  = nullptr; // likewise the shared expert run (GGML_CUDA_HC_PERSIST=4)
     std::vector<std::pair<const ggml_tensor *, int>> hcp_done; // (first node, length) computed early by a persistent kernel
     std::vector<const ggml_tensor *> early_done; // nodes computed early by a fused launch (multi-matrix gemv1)
+
+    // decode: the routed experts' weighted reduction left to the shared expert's down kernel (ggml_cuda_shexp_dec), which
+    // forms the sum while adding it: the reduction's output dst is never written
+    struct shexp_moe_t {
+        const ggml_tensor * dst     = nullptr;
+        const ggml_tensor * experts = nullptr;
+        const ggml_tensor * weights = nullptr;
+        int                 n_used  = 0;
+    } shexp_moe;
+
+    // qwen4exp decode: the sparse attention's row list (cells ascending, their mask values, count), built from the indexer
+    // top-k by ggml_cuda_hc_qsa_mask in place of the masked row, for the FLASH_ATTN_EXT node fa (fattn-sparse-gcn.cu)
+    struct spg_list_t {
+        const ggml_tensor * fa = nullptr;
+        std::unique_ptr<ggml_cuda_pool_alloc<int32_t>> idx, cnt;
+        std::unique_ptr<ggml_cuda_pool_alloc<half>>    mval;
+    } spg_list;
     // conv-state GET_ROWS gathers deferred into the GDN conv block kernel (read straight from the cache): (concat, gather);
     // the gather runs before the concat when the conv block does not fuse. Reset for every graph evaluation.
     std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> conv_state_rows;
@@ -1528,6 +1545,14 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // tensor-parallel decode chains (ggml_backend_cuda_comm_chain_compute): one captured graph per chain of subgraphs
+    struct chain_graph {
+        cudaGraph_t     graph    = nullptr;
+        cudaGraphExec_t instance = nullptr;
+        bool            warm     = false;
+    };
+    std::unordered_map<uint64_t, chain_graph> chain_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 

@@ -637,3 +637,135 @@ void ggml_cuda_idx_score_expand(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// qwen4exp pooled-key scores at decode: GET_ROWS(f16 pooled-key cache, block reps) -> MUL_MAT(., indexer q) in one pass
+// over the cached keys: the f32 copy of every block's key (n_blocks x 512 B) is never written or read back. 16 lanes per
+// row, 8 halves each (one 16-byte load), the N query columns in registers. The dot products are summed in another order
+// than MUL_MAT's, so the scores differ at the rounding level.
+template <int N>
+static __global__ void __launch_bounds__(256) qsa_gather_score(const char * __restrict__ k, const int32_t * __restrict__ ids,
+        const float * __restrict__ q, float * __restrict__ dst, const int n_rows, const int64_t k_nb1, const int64_t q_s1,
+        const int64_t d_s1) {
+    __shared__ float qs[N][128];
+    for (int t = threadIdx.x; t < N*128; t += blockDim.x) {
+        qs[t / 128][t % 128] = q[(t / 128)*q_s1 + t % 128];
+    }
+    __syncthreads();
+    const int l     = threadIdx.x & 15;
+    const int grp   = (blockIdx.x*blockDim.x + threadIdx.x) >> 4;
+    const int n_grp = (gridDim.x*blockDim.x) >> 4;
+    float qr[N][8];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qr[n][i] = qs[n][8*l + i];
+        }
+    }
+    // two rows per step: the id load and the dependent row load of the second overlap the first's
+    for (int r0 = grp; r0 < n_rows; r0 += 2*n_grp) {
+        const int  r1  = r0 + n_grp;
+        const bool ok1 = r1 < n_rows;
+        const int  id0 = ids[r0];
+        const int  id1 = ids[ok1 ? r1 : r0];
+        const int4 raw[2] = { *(const int4 *) (k + (int64_t) id0*k_nb1 + 16*l), *(const int4 *) (k + (int64_t) id1*k_nb1 + 16*l) };
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const half2 * h = (const half2 *) &raw[u];
+            float kf[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f = __half22float2(h[i]);
+                kf[2*i] = f.x;
+                kf[2*i + 1] = f.y;
+            }
+            const int r = u == 0 ? r0 : r1;
+#pragma unroll
+            for (int n = 0; n < N; ++n) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    acc += qr[n][i]*kf[i];
+                }
+                acc = warp_reduce_sum<16>(acc);
+                if (l == 0 && (u == 0 || ok1)) {
+                    dst[r + n*d_s1] = acc;
+                }
+            }
+        }
+    }
+}
+
+bool ggml_cuda_qsa_gather_score_supported(const ggml_tensor * gr, const ggml_tensor * mm) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_QSA_SCORE_FUSE"); return !e || atoi(e) != 0; }();
+    if (!enabled || !gr || !mm || mm->op != GGML_OP_MUL_MAT || mm->src[0] != gr || gr->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+    const ggml_tensor * k = gr->src[0], * ids = gr->src[1], * q = mm->src[1];
+    return k->type == GGML_TYPE_F16 && k->ne[0] == 128 && k->nb[0] == sizeof(half) && k->nb[1] % 16 == 0 &&
+        (uintptr_t) k->data % 16 == 0 && k->ne[2] == 1 && k->ne[3] == 1 &&
+        ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+        gr->type == GGML_TYPE_F32 && gr->ne[0] == 128 && gr->ne[1] == ids->ne[0] && gr->ne[2] == 1 && gr->ne[3] == 1 &&
+        gr->ne[1] <= INT_MAX &&
+        q->type == GGML_TYPE_F32 && q->ne[0] == 128 && q->ne[1] >= 1 && q->ne[1] <= 8 && q->ne[2] == 1 && q->ne[3] == 1 &&
+        q->nb[0] == sizeof(float) && q->nb[1] % sizeof(float) == 0 &&
+        mm->type == GGML_TYPE_F32 && mm->ne[0] == gr->ne[1] && mm->ne[1] == q->ne[1] && mm->ne[2] == 1 && mm->ne[3] == 1 &&
+        mm->nb[0] == sizeof(float) && mm->nb[1] % sizeof(float) == 0;
+}
+
+void ggml_cuda_qsa_gather_score(ggml_backend_cuda_context & ctx, const ggml_tensor * gr, ggml_tensor * mm) {
+    const ggml_tensor * k = gr->src[0], * ids = gr->src[1], * q = mm->src[1];
+    const int n_rows = (int) gr->ne[1];
+    {
+        // GGML_CUDA_QSA_DEBUG=1 (debug, with GGML_CUDA_DISABLE_GRAPHS=1): check every launch on the host (index range vs
+        // the key rows, output extent vs the score buffer) and abort with the details on a violation
+        static const bool dbg = [] { const char * e = getenv("GGML_CUDA_QSA_DEBUG"); return e && atoi(e) != 0; }();
+        if (dbg) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            std::vector<int32_t> h(n_rows);
+            CUDA_CHECK(cudaMemcpy(h.data(), ids->data, n_rows*sizeof(int32_t), cudaMemcpyDeviceToHost));
+            int32_t mx = INT32_MIN, mn = INT32_MAX;
+            for (int32_t v : h) { mx = std::max(mx, v); mn = std::min(mn, v); }
+            const ggml_tensor * kv = k->view_src ? k->view_src : k;
+            const char * kb = (const char *) ggml_backend_buffer_get_base(kv->buffer);
+            const size_t kbuf = ggml_backend_buffer_get_size(kv->buffer);
+            const size_t k_end = (size_t) ((const char *) k->data - kb) + (size_t) std::max(mx, 0)*k->nb[1] + 256;
+            const ggml_tensor * mv = mm->view_src ? mm->view_src : mm;
+            const char * mb = (const char *) ggml_backend_buffer_get_base(mv->buffer);
+            const size_t mbuf = ggml_backend_buffer_get_size(mv->buffer);
+            const size_t m_end = (size_t) ((const char *) mm->data - mb) + ((size_t) (n_rows - 1) + (size_t) (q->ne[1] - 1)*(mm->nb[1]/sizeof(float)) + 1)*sizeof(float);
+            const ggml_tensor * qv = q->view_src ? q->view_src : q;
+            const size_t q_end = (size_t) ((const char *) q->data - (const char *) ggml_backend_buffer_get_base(qv->buffer)) + (size_t) (q->ne[1]-1)*q->nb[1] + 128*sizeof(float);
+            const size_t qbuf = ggml_backend_buffer_get_size(qv->buffer);
+            const bool bad = mn < 0 || k_end > kbuf || m_end > mbuf || q_end > qbuf || mx >= kv->ne[1];
+            static int n_calls = 0;
+            ++n_calls;
+            if (bad || n_calls <= 2) {
+                fprintf(stderr, "qsa_chk call %d dev %d %s: rows %d ids [%d,%d] | k %s ne1 %lld nb1 %zu end %zu / buf %zu | mm %s ne [%lld,%lld] nb1 %zu end %zu / buf %zu | q %s ne [%lld,%lld] nb1 %zu end %zu / buf %zu\n",
+                    n_calls, ctx.device, bad ? "VIOLATION" : "ok", n_rows, mn, mx, kv->name, (long long) kv->ne[1], k->nb[1], k_end, kbuf,
+                    mm->name, (long long) mm->ne[0], (long long) mm->ne[1], mm->nb[1], m_end, mbuf,
+                    q->name, (long long) q->ne[0], (long long) q->ne[1], q->nb[1], q_end, qbuf);
+            }
+            if (bad) {
+                GGML_ABORT("qsa_gather_score: out-of-bounds launch");
+            }
+        }
+    }
+    // ~4 rows per 16-lane group (2 rows in flight per step): 64K-cell context, 16384 rows: 18 us (16 rows: 26 us, 1: 24 us)
+    const int nblk = (int) std::min<int64_t>(4096, std::max<int64_t>(1, ((int64_t) n_rows + 63)/64));
+    const int64_t q_s1 = q->nb[1]/sizeof(float), d_s1 = mm->nb[1]/sizeof(float);
+#define QSA_GS(N_) qsa_gather_score<N_><<<nblk, 256, 0, ctx.stream()>>>((const char *) k->data, (const int32_t *) ids->data, \
+        (const float *) q->data, (float *) mm->data, n_rows, (int64_t) k->nb[1], q_s1, d_s1)
+    switch (q->ne[1]) {
+        case 1: QSA_GS(1); break;
+        case 2: QSA_GS(2); break;
+        case 3: QSA_GS(3); break;
+        case 4: QSA_GS(4); break;
+        case 5: QSA_GS(5); break;
+        case 6: QSA_GS(6); break;
+        case 7: QSA_GS(7); break;
+        default: QSA_GS(8); break;
+    }
+#undef QSA_GS
+    CUDA_CHECK(cudaGetLastError());
+}

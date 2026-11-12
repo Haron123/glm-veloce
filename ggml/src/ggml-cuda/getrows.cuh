@@ -19,3 +19,7 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 // qwen4exp indexer: RELU -> head sum -> block bias -> block-to-cell expand -> + mask in one kernel (bit-identical)
 void ggml_cuda_idx_score_expand(ggml_backend_cuda_context & ctx, const ggml_tensor * score, const ggml_tensor * bias,
                                 const ggml_tensor * cell_blk, const ggml_tensor * mask, ggml_tensor * out);
+
+// qwen4exp decode: GET_ROWS(f16 pooled-key cache) -> MUL_MAT(indexer q) in one pass over the cached keys
+bool ggml_cuda_qsa_gather_score_supported(const ggml_tensor * gr, const ggml_tensor * mm);
+void ggml_cuda_qsa_gather_score(ggml_backend_cuda_context & ctx, const ggml_tensor * gr, ggml_tensor * mm);

@@ -19,3 +19,9 @@ bool ggml_cuda_shexp_gate_add_supported(const ggml_tensor * mm, const ggml_tenso
                                         const ggml_tensor * add);
 void ggml_cuda_shexp_gate_add(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * sig,
                               const ggml_tensor * mul, ggml_tensor * add);
+
+// decode (1 token), GCN: bf16 matvecs that share src1 and a long K (the HC down projection and its inject, both of
+// the normalized residual) in one launch over their concatenated rows. Returns false if a shape is not covered.
+#define GGML_CUDA_BF16MV_MAXM 4
+bool ggml_cuda_bf16mv_multi_supported(const ggml_tensor * mm);
+bool ggml_cuda_bf16mv_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * mms, int n);

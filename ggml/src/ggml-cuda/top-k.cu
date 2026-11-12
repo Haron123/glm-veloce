@@ -431,6 +431,16 @@ static __global__ void __launch_bounds__(BLOCK_SIZE) top_k_radix_mb(
 
     __shared__ int histogram[NBINS];
     __shared__ int suffix[NBINS];
+    // a block's range of up to UR*BLOCK_SIZE values stays in registers for the four passes and the gather (each pass
+    // read it again from memory)
+    constexpr int UR = 16; // 64 blocks per row: n_kv up to 256K
+    const bool regs = c_end - c_beg <= UR*BLOCK_SIZE;
+    uint32_t kr[UR];
+#pragma unroll
+    for (int u = 0; u < UR; ++u) {
+        const int col = c_beg + tid + u*BLOCK_SIZE;
+        kr[u] = regs && col < c_end ? top_k_float_to_ordered(row_src[col]) : 0u;
+    }
     uint32_t prefix = 0, mask = 0;
     int rank = k;
     for (int pass = 0; pass < 4; ++pass) {
@@ -456,6 +466,15 @@ static __global__ void __launch_bounds__(BLOCK_SIZE) top_k_radix_mb(
         };
         constexpr int U = 4;
         int col = c_beg + tid;
+        if (regs) {
+#pragma unroll
+            for (int u = 0; u < UR; ++u) {
+                if (c_beg + tid + u*BLOCK_SIZE < c_end) {
+                    count(kr[u]);
+                }
+            }
+            col = c_end;
+        }
         for (; col + (U - 1)*BLOCK_SIZE < c_end; col += U*BLOCK_SIZE) {
             float v[U];
 #pragma unroll
@@ -482,20 +501,36 @@ static __global__ void __launch_bounds__(BLOCK_SIZE) top_k_radix_mb(
         }
         topk_mb_barrier(sc, gridDim.x);
         // suffix sums of the global histogram (every block the same)
-        for (int b = tid; b < NBINS; b += BLOCK_SIZE) {
-            suffix[b] = __builtin_nontemporal_load(&gh[b]);
-        }
-        __syncthreads();
-        for (int step = 1; step < NBINS; step *= 2) {
-            int v = 0;
-            if (tid < NBINS) {
-                v = suffix[tid] + (tid + step < NBINS ? suffix[tid + step] : 0);
+        if constexpr (BLOCK_SIZE == NBINS && ggml_cuda_get_physical_warp_size() == 64) {
+            // as a prefix sum over the reversed bins: within each wave, then the totals of the waves before (2 syncs
+            // instead of 16)
+            __shared__ int s_wt[NBINS/64];
+            int v = warp_prefix_inclusive_sum<int, 64>(__builtin_nontemporal_load(&gh[NBINS - 1 - tid]));
+            if (tid % 64 == 63) {
+                s_wt[tid / 64] = v;
             }
             __syncthreads();
-            if (tid < NBINS) {
-                suffix[tid] = v;
+            for (int w = 0; w < tid / 64; ++w) {
+                v += s_wt[w];
+            }
+            suffix[NBINS - 1 - tid] = v;
+            __syncthreads();
+        } else {
+            for (int b = tid; b < NBINS; b += BLOCK_SIZE) {
+                suffix[b] = __builtin_nontemporal_load(&gh[b]);
             }
             __syncthreads();
+            for (int step = 1; step < NBINS; step *= 2) {
+                int v = 0;
+                if (tid < NBINS) {
+                    v = suffix[tid] + (tid + step < NBINS ? suffix[tid + step] : 0);
+                }
+                __syncthreads();
+                if (tid < NBINS) {
+                    suffix[tid] = v;
+                }
+                __syncthreads();
+            }
         }
         __shared__ int s_sel, s_rank;
         if (tid < NBINS) {
@@ -539,12 +574,7 @@ static __global__ void __launch_bounds__(BLOCK_SIZE) top_k_radix_mb(
     constexpr int WS = ggml_cuda_get_physical_warp_size();
     const int lane = tid % WS;
     const uint64_t below = lane == 63 ? ~0ull >> 1 : ((1ull << lane) - 1);
-    for (int col0 = c_beg; col0 < c_end; col0 += BLOCK_SIZE) {
-        const int col = col0 + tid;
-        uint32_t key = 0;
-        if (col < c_end) {
-            key = top_k_float_to_ordered(row_src[col]);
-        }
+    const auto gather = [&](const int col, const uint32_t key) {
         const bool gt = col < c_end && key > prefix;
         const bool eq = col < c_end && key == prefix;
         const uint64_t m_gt = __ballot(gt);
@@ -567,6 +597,73 @@ static __global__ void __launch_bounds__(BLOCK_SIZE) top_k_radix_mb(
             } else if (tbuf) {
                 s_tie[pos] = col;
             }
+        }
+    };
+    if (regs && WS == 64 && BLOCK_SIZE % 64 == 0) {
+        // one slot reservation per block (block prefix sums of the thread counts) instead of one returning atomic per
+        // wave and step on the row's counters (~500 at 33 blocks, serialized on one address)
+        constexpr int NWV = BLOCK_SIZE/64;
+        __shared__ int s_wgt[NWV], s_weq[NWV], s_bgt, s_beq;
+        int ngt = 0, neq = 0;
+#pragma unroll
+        for (int u = 0; u < UR; ++u) {
+            const bool ok = c_beg + tid + u*BLOCK_SIZE < c_end;
+            ngt += ok && kr[u] >  prefix;
+            neq += ok && kr[u] == prefix;
+        }
+        const int igt = warp_prefix_inclusive_sum<int, 64>(ngt);
+        const int ieq = warp_prefix_inclusive_sum<int, 64>(neq);
+        const int wv  = tid / 64;
+        if (lane == 63) {
+            s_wgt[wv] = igt;
+            s_weq[wv] = ieq;
+        }
+        __syncthreads();
+        int pg = igt - ngt, pe = ieq - neq;
+        int tg = 0, te = 0;
+#pragma unroll
+        for (int w = 0; w < NWV; ++w) {
+            pg += w < wv ? s_wgt[w] : 0;
+            pe += w < wv ? s_weq[w] : 0;
+            tg += s_wgt[w];
+            te += s_weq[w];
+        }
+        if (tid == 0) {
+            s_bgt = tg ? atomicAdd(&sc->gt[row], tg) : 0;
+            s_beq = te ? (ties ? atomicAdd(&s_ntie, te) : atomicAdd(&sc->eq[row], te)) : 0;
+        }
+        __syncthreads();
+        pg += s_bgt;
+        pe += s_beq;
+#pragma unroll
+        for (int u = 0; u < UR; ++u) {
+            const int  col = c_beg + tid + u*BLOCK_SIZE;
+            const bool ok  = col < c_end;
+            if (ok && kr[u] > prefix) {
+                row_dst[pg++] = col;
+            } else if (ok && kr[u] == prefix) {
+                const int pos = pe++;
+                if (!ties) {
+                    if (pos < rank) {
+                        row_dst[k - rank + pos] = col;
+                    }
+                } else if (tbuf) {
+                    s_tie[pos] = col;
+                }
+            }
+        }
+    } else if (regs) {
+#pragma unroll
+        for (int u = 0; u < UR; ++u) {
+            if (c_beg + u*BLOCK_SIZE >= c_end) {
+                break;
+            }
+            gather(c_beg + tid + u*BLOCK_SIZE, kr[u]);
+        }
+    } else {
+        for (int col0 = c_beg; col0 < c_end; col0 += BLOCK_SIZE) {
+            const int col = col0 + tid;
+            gather(col, col < c_end ? top_k_float_to_ordered(row_src[col]) : 0u);
         }
     }
     if (ties) {

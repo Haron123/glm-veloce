@@ -632,6 +632,14 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // large state buffers of erased entries, reused by later ones: a fresh buffer is zero-filled and page-faulted in
+    // (the recurrent state and its checkpoints are ~340 MiB per entry here: ~200 ms per save on a new conversation)
+    std::vector<std::vector<uint8_t>> spare;
+
+    void recycle(std::vector<uint8_t> && buf);
+    void recycle(server_prompt_cache_state && state);
+    std::vector<uint8_t> take(size_t n);
 };
 
 // used exclusively by router mode

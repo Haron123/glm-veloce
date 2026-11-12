@@ -27,3 +27,8 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+
+// Graph-safe AllReduce for decode chains (2 GPUs with P2P, F32 tensors up to 1 MB): eligible() checks a tensor,
+// launch() enqueues the in-place sum for GPU `rank` (0/1) on `stream`; capturable into a graph (device-side tokens).
+bool ggml_cuda_ar_chain_eligible(const ggml_cuda_ar_pipeline * pipeline, const ggml_tensor * t);
+void ggml_cuda_ar_chain_launch(ggml_cuda_ar_pipeline * pipeline, int rank, ggml_tensor * t, cudaStream_t stream);

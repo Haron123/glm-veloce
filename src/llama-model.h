@@ -643,6 +643,7 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_draft    = nullptr; // first LLAMA_MTP_DRAFT_VOCAB rows of output (MTP drafting under -sm tensor)
+    struct ggml_tensor * output_lo       = nullptr; // first rows of output on the first layer's device (LLAMA_HEAD_SPLIT, -sm layer)
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
@@ -816,6 +817,9 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // an output-class tensor placed on the device of layer 0 instead of the output device (LLAMA_HEAD_SPLIT)
+    ggml_tensor * create_tensor_layer0_dev(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

@@ -4,6 +4,16 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+
+// LLAMA_HEAD_SPLIT_USE=0: keep the single-device head although output.lo exists (A/B on one keeper layout)
+static bool qwen4exp_head_split_use() {
+    static const bool use = [] { const char * e = getenv("LLAMA_HEAD_SPLIT_USE"); return !e || atoi(e) != 0; }();
+    return use;
+}
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -192,6 +202,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             output_draft = create_tensor(tn(LLM_TENSOR_OUTPUT, "draft"), { n_embd, draft_vocab }, 0);
         }
     }
+    // LLAMA_HEAD_SPLIT=f under -sm layer: a copy of the first f*n_vocab rows of the LM head on layer 0's device, so the
+    // decode head (1..4 outputs) runs on two GPUs at once: the last device takes the other rows (a view of output) while
+    // the first device's idle GPU takes these. Every row is the same matvec as before, so the logits are bit-identical.
+    {
+        // default 0.5 when layer 0 and the head are on different devices (+1.9% raw tg, +3.3% MTP n2 at 120 W; 218 MB
+        // more on the first device); LLAMA_HEAD_SPLIT=0 off
+        static const double head_split = [] { const char * e = getenv("LLAMA_HEAD_SPLIT"); return e ? atof(e) : 0.5; }();
+        if (output != nullptr && head_split > 0.0 && head_split < 1.0 && split_mode() == LLAMA_SPLIT_MODE_LAYER && output->ne[2] == 1 &&
+                dev_layer(0) != dev_output()) {
+            const int64_t m0 = ((int64_t) (head_split*(double) n_vocab) / 256)*256;
+            if (m0 > 0 && m0 < n_vocab && ml.add_prefix_rows_alias("output.weight", "output.lo", m0)) {
+                output_lo = create_tensor_layer0_dev(tn(LLM_TENSOR_OUTPUT, "lo"), { n_embd, m0 }, 0);
+            }
+        }
+    }
     // tie_word_embeddings is false here: never tie to a token_embd a borrowing draft lacks.
     if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
@@ -344,6 +369,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
+    if (inject) {
+        // placed next to the down projection, which reads the same xn: the backend computes both in one launch
+        ggml_build_forward_expand(gf, lo);
+        *inject = build_lora_mm(w_inject, xn);
+        cb(*inject, "hc_inject", il);
+        ggml_build_forward_expand(gf, *inject);
+    }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
@@ -372,11 +404,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
     cb(mixed, "hc_mixed", il);
-
-    if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
-        cb(*inject, "hc_inject", il);
-    }
 
     return mixed;
 }
@@ -525,9 +552,27 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    if (model.output_lo != nullptr && qwen4exp_head_split_use() && model.output_s == nullptr && samplers.empty() && n_outputs >= 1 && n_outputs <= 4) {
+        // the first device's rows first in graph order: its split starts (async) before the last device's, which needs
+        // nothing from it, so the two halves run at the same time; the host gathers both into one logits row
+        const int64_t m0 = model.output_lo->ne[1];
+        ggml_tensor * lo = build_lora_mm(model.output_lo, cur, nullptr);
+        cb(lo, "result_output_lo", -1);
+        ggml_build_forward_expand(gf, lo);
+        ggml_tensor * w_hi = ggml_view_2d(ctx0, model.output, model.output->ne[0], model.output->ne[1] - m0, model.output->nb[1],
+                                          m0*model.output->nb[1]);
+        // bind the view to the weight buffer now: the scheduler places a matmul by its weight's buffer, and an unbound
+        // view has none (it would follow its neighbour to the first device and copy 218 MB of weights per token)
+        ggml_backend_view_init(w_hi);
+        cur = build_lora_mm(w_hi, cur, nullptr);
+        cb(cur, "result_output", -1);
+        res->t_logits    = cur;
+        res->t_logits_lo = lo;
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -698,6 +743,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // no res->t_embd: it is n_embd wide, but the context sizes that buffer by n_embd_out.
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    const llama_model * head_owner = &model;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     ggml_tensor * head_draft = layer.nextn.shared_head_head ? nullptr : model.output_draft;
     if (head_w == nullptr) {
@@ -705,6 +751,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         head_w = other.output;
         head_s = other.output_s;
         head_draft = other.output_draft;
+        head_owner = &other;
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
@@ -724,6 +771,23 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         // -sm tensor: the row-split prefix copy; the logits are only K wide and the context pads them to n_vocab
         // with -inf (llama_context output extraction)
         cur = build_lora_mm(head_draft, cur, nullptr);
+    } else if (head_w == head_owner->output && head_owner->output_lo != nullptr && head_s == nullptr && draft_vocab <= 0 &&
+               qwen4exp_head_split_use() && n_outputs >= 1 && n_outputs <= 4) {
+        // LLAMA_HEAD_SPLIT: the draft head on both GPUs, as the trunk's (see there). The draft samples on the device, so
+        // the halves are joined on the last device; the x1 scale is a split boundary on the first device between the two
+        // matmuls and the join (without it the join's copy of the first half would make the second matmul wait)
+        const int64_t m0 = head_owner->output_lo->ne[1];
+        ggml_tensor * lo = build_lora_mm(head_owner->output_lo, cur, nullptr);
+        ggml_build_forward_expand(gf, lo);
+        ggml_tensor * w_hi = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_w->ne[1] - m0, head_w->nb[1], m0*head_w->nb[1]);
+        ggml_backend_view_init(w_hi);
+        ggml_tensor * hi = build_lora_mm(w_hi, cur, nullptr);
+        ggml_build_forward_expand(gf, hi);
+        ggml_tensor * lo2 = ggml_scale(ctx0, lo, 1.0f);
+        cb(lo2, "result_output_lo_pin", -1);
+        ggml_build_forward_expand(gf, lo2);
+        cur = ggml_concat(ctx0, lo2, hi, 0);
+        cb(cur, "result_output_cat_pin", -1);
     } else if (draft_vocab > 0 && draft_vocab < n_vocab_head && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
         ggml_tensor * w_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
         cur = build_lora_mm(w_sub, cur, head_s);
@@ -765,6 +829,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
 
     return ggml_mul(ctx0, normalized, gated);
+}
+
+// an image chunk (embeddings, or tokens sharing a position): mrope gives all its cells one position, so its update
+// touches every block of the image so far, not ~n_tokens/ratio of them; such ubatches size the pool update for all
+// blocks, as a rebuild does (the per-token bound overflowed at the second chunk of an image)
+static bool qwen4exp_qsa_update_all(const llama_ubatch & ub) {
+    static const bool on = [] { const char * e = getenv("LLAMA_QSA_IMG_ALL"); return !e || atoi(e) != 0; }(); // 0: old bound (debug)
+    if (!on) {
+        return false;
+    }
+    if (ub.embd != nullptr) {
+        return true;
+    }
+    for (uint32_t i = 1; ub.pos != nullptr && i < ub.n_tokens; ++i) {
+        if (ub.pos[i] == ub.pos[i - 1]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
@@ -811,7 +894,8 @@ public:
         if (pool_reps) {
             const int64_t n_tps       = params.ubatch.n_tokens/n_stream;
             const bool    rebuild_now = idx->get_kv()->get_kpool_dirty();
-            const int64_t n_new       = rebuild_now ? n_blocks : (n_tps + ratio - 1)/ratio + 2;
+            const bool    all_now     = rebuild_now || qwen4exp_qsa_update_all(params.ubatch);
+            const int64_t n_new       = all_now ? n_blocks : (n_tps + ratio - 1)/ratio + 2;
 
             res &= pool_reps->ne[0]      == n_blocks && pool_reps->ne[1] == n_stream;
             res &= new_pool_cells->ne[0] == (int64_t) ratio*n_new && new_pool_cells->ne[1] == n_stream;
@@ -969,7 +1053,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             // fixed for the decode phase: a shape tracking blocks-closed-this-step would flip the
             // graph topology every r tokens and force CUDA-graph recapture
             qsa->rebuild   = mctx_idx->get_kv()->get_kpool_dirty();
-            qsa->n_new_max = qsa->rebuild ? n_blocks : (n_tps + r - 1)/r + 2;
+            qsa->n_new_max = qsa->rebuild || qwen4exp_qsa_update_all(ubatch) ? n_blocks : (n_tps + r - 1)/r + 2;
 
             qsa->pool_reps      = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
             qsa->new_pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*qsa->n_new_max, n_stream);
@@ -1006,7 +1090,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
     }
 
-    // get_k gives [idx_dim, n_head_kv, n_kv, n_stream]; head 0 is the raw key of every cell
+    // get_k gives [head size (idx_dim, padded with kpool), n_head_kv, n_kv, n_stream]; head 0 is the raw key of every cell
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
 
     ggml_tensor * pooled = nullptr;
@@ -1034,11 +1118,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // the write is by GLOBAL row while pool_reps is stream-local, so the read must not chain
         // off the write tensor; expand first and let build order sequence them
+        // head 1 starts one (padded) head in: k_all->ne[0] values
         ggml_build_forward_expand(gf,
-                mctx_idx->cpy_k_part(ctx0, pool_new, inp->new_pool_reps, il, idx_dim, idx_dim));
+                mctx_idx->cpy_k_part(ctx0, pool_new, inp->new_pool_reps, il, idx_dim, k_all->ne[0]));
 
         ggml_tensor * pooled_rd = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream,
-                k_all->nb[2], k_all->nb[3], idx_dim*k_all->nb[0]);
+                k_all->nb[2], k_all->nb[3], k_all->nb[1]);
 
         // rows come back f32 (get_rows widens the f16 cache). a block with no key gathers row 0,
         // and its bias is -inf, so it is never selected
@@ -1638,6 +1723,23 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+
+#ifndef _WIN32
+    // the table is mmapped and may not be in RAM. Ask for all rows now, so the reads run in parallel instead of one page
+    // fault after the other in the gather (16 serial SATA reads cost ~3 ms per token; a 2048-token prompt of new text ran
+    // at 1/3 speed). LLAMA_PLE_WILLNEED: 0 off, 1 every ubatch (default), 2 only ubatches of up to 8 tokens
+    static const int willneed = [] { const char * e = getenv("LLAMA_PLE_WILLNEED"); return e ? atoi(e) : 1; }();
+    const ggml_tensor * tab = pmodel.per_layer_tok_embd;
+    if (willneed != 0 && (willneed == 1 || n_tokens <= 8) && tab != nullptr && tab->data != nullptr && tab->buffer != nullptr &&
+            ggml_backend_buffer_is_host(tab->buffer)) {
+        const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+        for (const int32_t r : idx) {
+            const uintptr_t beg = ((uintptr_t) tab->data + (uintptr_t) r*tab->nb[1]) & ~(page - 1);
+            const uintptr_t end = (uintptr_t) tab->data + ((uintptr_t) r + 1)*tab->nb[1];
+            (void) madvise((void *) beg, end - beg, MADV_WILLNEED);
+        }
+    }
+#endif
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

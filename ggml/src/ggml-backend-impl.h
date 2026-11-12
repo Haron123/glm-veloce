@@ -118,6 +118,18 @@ extern "C" {
         void * user_data;
     };
 
+    // one host-staged input of a graph: the meta backend collects these and replaces the per-input async copies of
+    // a decode step with one device-side scatter per simple backend (see stage_host_input). Layout shared with the
+    // CUDA comm implementation; j indexes the simple backend.
+    struct ggml_backend_blob_entry {
+        char *   dst[2];      // device base of child j's chunk
+        uint64_t src[2];      // first source byte within the pinned blob (offset of child j's chunk)
+        uint64_t row[2];      // bytes per dst row of child j (0: child has no share)
+        uint64_t rows;        // row count
+        uint64_t src_stride;  // bytes between source rows (within the full input)
+    };
+
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 
@@ -129,6 +141,9 @@ extern "C" {
         void (*set_tensor_2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
         void (*get_tensor_2d_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
         bool (*cpy_tensor_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+        // (optional) buffer a host-staged input upload (data: readable host memory) and upload all buffered inputs
+        // of the step at the next graph_compute from the backend's pinned blob; return false to use set_tensor_async
+        bool (*stage_host_input)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t size);
 
         // (optional) complete all pending operations (required if the backend supports async operations)
         void (*synchronize)(ggml_backend_t backend);

@@ -12,11 +12,11 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
-// LLAMA_QSA_KPOOL, default off (opt-in, =1 enables): cache each block's pooled indexer key in a second key head, so the
-// pool+norm+rope chain runs once per completed block instead of once per ubatch. Off by default because it measured
-// neutral at 88.7K on 2x MI50 (tg 28.66 vs 28.45; the context cost lives in the score/expand/top_k chain, not the pool
-// chain), kept as the enabler for the fused lightning indexer. Unset restores the single-head buffer and the per-ubatch
-// chain, bit-identical to before the cache existed.
+// LLAMA_QSA_KPOOL, default on (=0 disables): cache each block's pooled indexer key in a second key head, so the
+// pool+norm+rope chain runs once per completed block instead of once per ubatch, and decode scores read the cached keys
+// directly (fused GET_ROWS + MUL_MAT on CUDA/HIP). It measured neutral while per-token host input work hid it; with that
+// fixed, tg at 64K context 45.6 -> 49.0 t/s (2x MI50). =0 restores the single-head buffer and the per-ubatch chain,
+// bit-identical to before the cache existed.
 bool llama_qsa_kpool_enabled();
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
@@ -113,6 +113,26 @@ private:
     // a pooled key is a pure function of its block's cells, so anything structural must re-pool
     // once. conservative on purpose: a needless rebuild costs one pass, a missed one serves a stale key
     void kpool_invalidate();
+
+    // the flat (one sequence) grouping of set_input_qsa, kept between calls: a decode step only fills cells, so the next
+    // call updates the few blocks they touch instead of rescanning every cell (single stream only)
+    struct qsa_inc_state {
+        bool                   valid    = false;
+        const void *           cells    = nullptr;
+        int64_t                r        = 0;
+        int64_t                n_kv     = 0;
+        int64_t                n_blocks = 0;
+        std::vector<llama_pos> pos;       // [n_kv] the cells' positions this state describes
+        std::vector<uint64_t>  slots;     // [n_blocks] slots present per position block
+        std::vector<int32_t>   first;     // [n_blocks] lowest cell of each position block
+        std::vector<int32_t>   bid;       // [n_blocks] block id of a complete position block, else -1
+        std::vector<int32_t>   members;   // [r*n_blocks] cell of each slot, -1 if absent
+        std::vector<int32_t>   blk_of;    // [n_kv] block id of each cell, -1 if in no complete block
+        std::vector<int32_t>   bid_idx;   // per block id: first position
+        std::vector<int32_t>   bid_cell;  // per block id: lowest cell
+        int64_t                pb_last  = -1; // last complete position block
+    };
+    mutable qsa_inc_state qsa_inc;
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given

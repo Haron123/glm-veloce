@@ -10,6 +10,8 @@
 //   global store drains all loads (s_waitcnt vmcnt(0)); so block syncs are LDS-only, the barrier runs on the scalar
 //   memory path, and the HC up weights stream across the barrier.
 // Weights are read in their raw q8_0 layout as dword-aligned block pairs (68 B): K groups start at even q8 blocks.
+#include "fattn-sparse-gcn.cuh"
+#include "mmvq.cuh"
 #include "hc-persist.cuh"
 #include "unary.cuh"
 #include "hc-dec.cuh"
@@ -1962,7 +1964,7 @@ void ggml_cuda_hc_gdn_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cgr
         const ggml_tensor * y = cgraph->nodes[mm_idx]->src[1];
         const int64_t K = y->ne[0];
         const size_t nbytes = (size_t) y->ne[1]*K/QK8_1*sizeof(block_q8_1);
-        ctx.q8_cache.push_back({ y, (int) GGML_TYPE_Q8_0, { K, y->ne[1], 1, 1 },
+        ctx.q8_cache.push_back({ ggml_cuda_q8_cache_key(y), (int) GGML_TYPE_Q8_0, { K, y->ne[1], 1, 1 },
                                  std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes) });
         yq = (block_q8_1 *) ctx.q8_cache.back().buf->get();
     }
@@ -2019,7 +2021,11 @@ int ggml_cuda_hc_attn_gate_match(const ggml_cgraph * cgraph, int i, int * mm_idx
     if (g0 < y0 + ggml_nbytes(ml) && y0 < g0 + ggml_nbytes(gv)) {
         return 0;
     }
-    if (i + 3 < cgraph->n_nodes && nd[3]->op == GGML_OP_MUL_MAT && nd[3]->src[1] == ml && nd[3]->src[0]->type == GGML_TYPE_Q8_0 &&
+    // the output projection reads the q8_1 copy through the q8 cache: q8_0, or any quantized type when the cache serves all
+    // types (GGML_CUDA_Q8_CACHE_ANYTYPE, the default; Qwen3.8 Flash-Next: q6_K)
+    static const bool any_type = [] { const char * e = getenv("GGML_CUDA_Q8_CACHE_ANYTYPE"); return !e || atoi(e) != 0; }();
+    if (i + 3 < cgraph->n_nodes && nd[3]->op == GGML_OP_MUL_MAT && nd[3]->src[1] == ml &&
+            (nd[3]->src[0]->type == GGML_TYPE_Q8_0 || (any_type && ggml_is_quantized(nd[3]->src[0]->type))) &&
             ml->ne[0] % 512 == 0 && ml->ne[2] == 1) {
         *mm_idx = i + 3;
     }
@@ -2036,7 +2042,7 @@ void ggml_cuda_hc_attn_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph *
         const ggml_tensor * y = cgraph->nodes[mm_idx]->src[1];
         const int64_t K = y->ne[0];
         const size_t nbytes = (size_t) y->ne[1]*K/QK8_1*sizeof(block_q8_1);
-        ctx.q8_cache.push_back({ y, (int) GGML_TYPE_Q8_0, { K, y->ne[1], 1, 1 },
+        ctx.q8_cache.push_back({ ggml_cuda_q8_cache_key(y), (int) GGML_TYPE_Q8_0, { K, y->ne[1], 1, 1 },
                                  std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes) });
         yq = (block_q8_1 *) ctx.q8_cache.back().buf->get();
     }
@@ -2048,18 +2054,24 @@ void ggml_cuda_hc_attn_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph *
 // sparse attention mask from the indexer's top-k (long contexts): CONT(top_k) -> FILL(mask, -inf) -> SET_ROWS(zeros at the
 // selected cells) -> ADD(mask) is out[t][j] = mask[t][j] for the selected cells, -inf elsewhere (0 + x = x in f16, so
 // bit-identical); one block per query row
+// grid (column chunks, query rows): a block fills its chunk with -inf, then takes the selected cells that fall inside it
+// from the whole top-k row. Decode splits a row into 4096-cell chunks (one block filling all n_kv cells alone took 21 us at
+// 64K context); prompt-sized ubatches keep one block per row (each chunk re-reads the row's top-k list)
 static __global__ void hc_qsa_mask(const int32_t * __restrict__ top_k, const half * __restrict__ mask, half * __restrict__ out,
         const int n_kv, const int width, const int64_t tk_s1, const int64_t m_s1, const int64_t o_s1) {
-    const int t = blockIdx.x;
+    const int t     = blockIdx.y;
+    const int chunk = (n_kv + gridDim.x - 1)/gridDim.x;
+    const int j0    = blockIdx.x*chunk;
+    const int j1    = min(j0 + chunk, n_kv);
     half * o = out + t*o_s1;
     const half * m = mask + t*m_s1;
-    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+    for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
         o[j] = __float2half(-INFINITY);
     }
     __syncthreads();
     for (int k = threadIdx.x; k < width; k += blockDim.x) {
         const int j = top_k[t*tk_s1 + k];
-        if (j >= 0 && j < n_kv) {
+        if (j >= j0 && j < j1) {
             o[j] = m[j];
         }
     }
@@ -2162,6 +2174,22 @@ int ggml_cuda_hc_qsa_mask(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
     const ggml_tensor * tk = c.tk, * mask = c.mask, * ad = c.ad;
     const int64_t n_kv = mask->ne[0], T = mask->ne[1];
     const int width = c.width;
+    // decode: when the masked row only feeds a sparse decode attention, that attention takes its row list straight from
+    // the top-k and the row is never built (GGML_CUDA_SPG_LIST=0: off)
+    if (T == 1 && tk->ne[1] == 1) {
+        const int i_ad = c.idx[3];
+        for (int j = i_ad + 1; j < std::min(cgraph->n_nodes, i_ad + 32); ++j) {
+            const ggml_tensor * fa = cgraph->nodes[j];
+            if (fa->op != GGML_OP_FLASH_ATTN_EXT) {
+                continue;
+            }
+            if (fa->src[3] == ad && ggml_node_get_use_count(cgraph, i_ad) == 1 && !(ad->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    ggml_cuda_spg_list_from_topk(ctx, fa, (const int32_t *) tk->data, width, mask)) {
+                return c.idx[3] - i;
+            }
+            break;
+        }
+    }
     // the allocator may place the FILL/ADD result over the TOP_K result (its only consumer, the CONT, is skipped): then
     // stage the indices in pool memory first
     const int32_t * tkd = (const int32_t *) tk->data;
@@ -2183,7 +2211,9 @@ int ggml_cuda_hc_qsa_mask(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         tkd = tk_copy.get();
         tk_s1 = width;
     }
-    hc_qsa_mask<<<(unsigned) T, 256, 0, ctx.stream()>>>(tkd, (const half *) mask->data, (half *) ad->data,
+    const unsigned n_chunks = T <= 8 ? (unsigned) ((n_kv + 4095)/4096) : 1u;
+    hc_qsa_mask<<<dim3(n_chunks, (unsigned) T), 256, 0, ctx.stream()>>>(tkd,
+        (const half *) mask->data, (half *) ad->data,
         (int) n_kv, width, tk_s1, mask->nb[1]/sizeof(half), ad->nb[1]/sizeof(half));
     CUDA_CHECK(cudaGetLastError());
     return c.idx[3] - i;

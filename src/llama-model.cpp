@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-weight-keeper.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -35,6 +36,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1906,6 +1908,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
+    llama_weight_keeper * keeper = ml.no_alloc ? nullptr : llama_weight_keeper::get();
+    if (keeper) {
+        keeper->set_files(ml.files);
+    }
+    std::set<ggml_context *> ctx_imported;
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
@@ -1974,7 +1982,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                buf = keeper ? keeper->import_ctx(ctx, buft) : nullptr;
+                if (buf) {
+                    ctx_imported.insert(ctx);
+                } else {
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -2040,9 +2053,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        if (ctx_imported.count(ctx) > 0) {
+            continue;
+        }
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    if (keeper && keeper->exporting) {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (buf_map.size() > 0 && !ggml_backend_buffer_is_host(buf_map.begin()->second)) {
+                keeper->add_export(ctx, buf_map.begin()->second);
+            }
+        }
+        keeper->serve();
     }
 
     if (use_mmap_buffer) {
@@ -3457,6 +3482,13 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_layer0_dev(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    GGML_ASSERT(ml != nullptr);
+    GGML_ASSERT(!pimpl->dev_layer.empty());
+    return ml->create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_layer.at(0).buft_list, nullptr,
+        tn, ne, flags);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

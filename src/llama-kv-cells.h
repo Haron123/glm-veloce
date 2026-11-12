@@ -387,6 +387,11 @@ public:
     }
 
     // note: call only if the cell is not empty
+    // the position of every cell (-1 = empty), for readers that compare whole snapshots
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
         assert(pos[i] != -1);

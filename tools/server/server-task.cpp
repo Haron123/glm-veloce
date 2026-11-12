@@ -1708,6 +1708,48 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+void server_prompt_cache::recycle(std::vector<uint8_t> && buf) {
+    // keep at most a few large buffers (~1.5 GiB): enough for the next entries, bounded when entries shrink
+    constexpr size_t MIN_SIZE  = 1u << 20;
+    constexpr size_t MAX_TOTAL = 3ull << 29;
+    if (buf.capacity() < MIN_SIZE) {
+        return;
+    }
+    size_t total = 0;
+    for (const auto & b : spare) {
+        total += b.capacity();
+    }
+    if (total + buf.capacity() <= MAX_TOTAL) {
+        spare.push_back(std::move(buf));
+    }
+}
+
+void server_prompt_cache::recycle(server_prompt_cache_state && state) {
+    recycle(std::move(state.data.main));
+    recycle(std::move(state.data.drft));
+    for (auto & ckpt : state.prompt.checkpoints) {
+        recycle(std::move(ckpt.data_tgt));
+        recycle(std::move(ckpt.data_dft));
+    }
+}
+
+std::vector<uint8_t> server_prompt_cache::take(size_t n) {
+    // the smallest spare buffer that holds n bytes (its pages are already mapped), else a new one
+    int best = -1;
+    for (int i = 0; i < (int) spare.size(); ++i) {
+        if (spare[i].capacity() >= n && (best < 0 || spare[i].capacity() < spare[best].capacity())) {
+            best = i;
+        }
+    }
+    std::vector<uint8_t> res;
+    if (best >= 0) {
+        res = std::move(spare[best]);
+        spare.erase(spare.begin() + best);
+    }
+    res.resize(n);
+    return res;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1741,6 +1783,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            recycle(std::move(*it));
             it = states.erase(it);
         } else {
             ++it;
@@ -1753,6 +1796,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            recycle(std::move(states.front()));
             states.pop_front();
         }
     }
@@ -1760,10 +1804,29 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
 
+    // the checkpoints are copied into reused buffers too (copying the list would allocate fresh ones)
+    std::list<common_prompt_checkpoint> ckpts;
+
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        state_data_tgt = take(state_size_tgt);
+        state_data_dft = take(state_size_dft);
+        for (const auto & c : prompt.checkpoints) {
+            auto & d = ckpts.emplace_back();
+            d.n_tokens  = c.n_tokens;
+            d.id_task   = c.id_task;
+            d.pos_min   = c.pos_min;
+            d.pos_max   = c.pos_max;
+            d.data_spec = c.data_spec;
+            d.data_tgt  = take(c.data_tgt.size());
+            d.data_dft  = take(c.data_dft.size());
+            if (!c.data_tgt.empty()) {
+                memcpy(d.data_tgt.data(), c.data_tgt.data(), c.data_tgt.size());
+            }
+            if (!c.data_dft.empty()) {
+                memcpy(d.data_dft.data(), c.data_dft.data(), c.data_dft.size());
+            }
+        }
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1779,7 +1842,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(ckpts),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1836,8 +1899,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            recycle(std::move(data));
         }
 
         {
@@ -1854,8 +1916,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                recycle(std::move(data));
             }
         }
 

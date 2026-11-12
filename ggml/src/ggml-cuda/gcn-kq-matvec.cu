@@ -32,6 +32,107 @@ static __device__ __forceinline__ void kqmv_load16_a2(const char * p, int * out)
     out[3] = (int) __builtin_amdgcn_alignbyte(v4, v3, sh);
 }
 
+// raw words of one item, loaded ahead of the math so a lane keeps several items in flight (q6_K / iq4_xs)
+struct kqmv_raw {
+    int w[14];
+};
+
+// the dwords around 16 bytes at a 2-byte aligned address, joined by kqmv_join16
+static __device__ __forceinline__ void kqmv_ld5(const char * p, int * w) {
+    const uint32_t * a = (const uint32_t *) ((uintptr_t) p & ~(uintptr_t) 3);
+    const bool odd = ((uintptr_t) p & 3) != 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        w[i] = (int) a[i];
+    }
+    w[4] = (int) a[odd ? 4 : 3];
+}
+
+static __device__ __forceinline__ void kqmv_join16(const int * w, const int sh, int * out) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        out[i] = (int) __builtin_amdgcn_alignbyte((uint32_t) w[i + 1], (uint32_t) w[i], sh);
+    }
+}
+
+template <ggml_type type>
+static __device__ __forceinline__ void kqmv_load(const char * __restrict__ row, const int it, kqmv_raw & r) {
+    const int sb = it >> 3;
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        const int q = it & 7, n = q >> 2, c = q & 3;
+        const char * b = row + sb*(int) sizeof(block_q6_K);
+        kqmv_ld5(b + 64*n + 16*c, r.w);
+        kqmv_ld5(b + 128 + 32*n + 16*(c & 1), r.w + 5);
+        // scales[8n .. 8n+7] and d: 10 bytes at b + 192 + 8n (2-byte aligned) in 3 dwords + the d word
+        const uint32_t * a = (const uint32_t *) ((uintptr_t) (b + 192 + 8*n) & ~(uintptr_t) 3);
+        r.w[10] = (int) a[0];
+        r.w[11] = (int) a[1];
+        r.w[12] = (int) a[2];
+        r.w[13] = (int) *(const unsigned short *) (b + 208);
+    } else {
+        static_assert(type == GGML_TYPE_IQ4_XS, "unsupported type");
+        const int ib = it & 7;
+        const char * b = row + sb*(int) sizeof(block_iq4_xs);
+        r.w[0] = *(const int *) b;
+        r.w[1] = *(const int *) (b + 4);
+        const uint2 q0 = *(const uint2 *) (b + 8 + 16*ib);
+        const uint2 q1 = *(const uint2 *) (b + 16 + 16*ib);
+        r.w[2] = (int) q0.x; r.w[3] = (int) q0.y; r.w[4] = (int) q1.x; r.w[5] = (int) q1.y;
+    }
+}
+
+// the same item as kqmv_decode<type> from the raw words
+template <ggml_type type>
+static __device__ __forceinline__ void kqmv_unpack(const char * __restrict__ row, const int it, const kqmv_raw & raw, kqmv_item & r) {
+    const int sb = it >> 3;
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        const int q = it & 7, n = q >> 2, c = q & 3;
+        const char * b = row + sb*(int) sizeof(block_q6_K);
+        int ql[4], qh[4];
+        kqmv_join16(raw.w,     (int) ((uintptr_t) (b + 64*n + 16*c) & 3), ql);
+        kqmv_join16(raw.w + 5, (int) ((uintptr_t) (b + 128 + 32*n + 16*(c & 1)) & 3), qh);
+        const int shl = c < 2 ? 0 : 2;
+        const int shh = c < 2 ? 4 : 6;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            r.qa[i] = ( ql[i]       & 0x0F0F0F0F) | (((qh[i] >> shl) & 0x03030303) << 4);
+            r.qb[i] = ((ql[i] >> 4) & 0x0F0F0F0F) | (((qh[i] >> shh) & 0x03030303) << 4);
+        }
+        // byte k of the 8 scales of half n sits at byte offset off + k of the 3 dwords
+        const int off = (int) ((uintptr_t) (b + 192 + 8*n) & 3);
+        const auto sc8 = [&](const int k) {
+            const int pos = off + k;
+            const uint32_t w = (uint32_t) (pos < 4 ? raw.w[10] : pos < 8 ? raw.w[11] : raw.w[12]);
+            return (int) (int8_t) (w >> (8*(pos & 3)));
+        };
+        const float d = __half2float(__ushort_as_half((unsigned short) raw.w[13]));
+        const int is = c & 1;
+        r.fa = d*sc8((c < 2 ? 0 : 2) + is);
+        r.fb = d*sc8((c < 2 ? 4 : 6) + is);
+        r.ma = 32.0f*r.fa;
+        r.mb = 32.0f*r.fb;
+        r.ra = sb*16 + 8*n + c;
+        r.rb = r.ra + 4;
+    } else {
+        const int ib = it & 7;
+        const uint32_t h = (uint32_t) raw.w[0];
+        const int qs[4] = { raw.w[2], raw.w[3], raw.w[4], raw.w[5] };
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int2 v = get_int_from_table_16(qs[i], kvalues_iq4nl);
+            r.qa[i] = v.x;
+            r.qb[i] = v.y;
+        }
+        const int lsb = (int) (((uint32_t) raw.w[1] >> (8*(ib/2))) & 0xFF);
+        const int ls  = ((lsb >> (4*(ib & 1))) & 0xF) | (((h >> (16 + 2*ib)) & 3) << 4);
+        const float d = __half2float(__ushort_as_half((unsigned short) (h & 0xFFFF)));
+        r.fa = r.fb = d*(ls - 32);
+        r.ma = r.mb = 0.0f;
+        r.ra = (sb*8 + ib)*2;
+        r.rb = r.ra + 1;
+    }
+}
+
 // q4_K / q5_K (as moe_coal_kq_item): item = 16 bytes of qs, low nibbles = 16 values of sub-block 2p, high nibbles = the
 // same 16 positions of sub-block 2p + 1 (q5_K: 5th bits from qh)
 template <bool Q5>
@@ -151,6 +252,10 @@ static __device__ __forceinline__ void kqmv_decode(const char * __restrict__ row
     }
 }
 
+#ifndef KQMV_PF
+#define KQMV_PF 2
+#endif
+
 template <ggml_type type, int NT, int LPR>
 __launch_bounds__(256)
 static __global__ void gcn_kq_mv(const char * __restrict__ W, const block_q8_1 * __restrict__ y, float * __restrict__ dst,
@@ -203,10 +308,7 @@ static __global__ void gcn_kq_mv(const char * __restrict__ W, const block_q8_1 *
         for (int t = 0; t < NT; ++t) {
             acc[t] = 0.0f;
         }
-#pragma unroll 2
-        for (int it = sub; it < nit; it += LPR) {
-            kqmv_item r;
-            kqmv_decode<type>(wr, it, r);
+        const auto accum = [&](const kqmv_item & r) {
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
                 const int4 A = *(const int4 *) (yq + t*K + 16*r.ra);
@@ -223,6 +325,50 @@ static __global__ void gcn_kq_mv(const char * __restrict__ W, const block_q8_1 *
                     v -= da*(r.ma*ysum[t*2*nyb + r.ra]) + db*(r.mb*ysum[t*2*nyb + r.rb]);
                 }
                 acc[t] += v;
+            }
+        };
+        if constexpr (type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS) {
+            // the next PF items of the lane are loaded while the current PF are decoded (the same items in the same
+            // order as the plain loop, so the same sums)
+            constexpr int PF = KQMV_PF;
+            kqmv_raw cur[PF];
+#pragma unroll
+            for (int p = 0; p < PF; ++p) {
+                const int it = sub + p*LPR;
+                if (it < nit) {
+                    kqmv_load<type>(wr, it, cur[p]);
+                }
+            }
+#pragma unroll 1
+            for (int it0 = sub; it0 < nit; it0 += PF*LPR) {
+                kqmv_raw nxt[PF];
+#pragma unroll
+                for (int p = 0; p < PF; ++p) {
+                    const int it = it0 + (PF + p)*LPR;
+                    if (it < nit) {
+                        kqmv_load<type>(wr, it, nxt[p]);
+                    }
+                }
+#pragma unroll
+                for (int p = 0; p < PF; ++p) {
+                    const int it = it0 + p*LPR;
+                    if (it < nit) {
+                        kqmv_item r;
+                        kqmv_unpack<type>(wr, it, cur[p], r);
+                        accum(r);
+                    }
+                }
+#pragma unroll
+                for (int p = 0; p < PF; ++p) {
+                    cur[p] = nxt[p];
+                }
+            }
+        } else {
+#pragma unroll 2
+            for (int it = sub; it < nit; it += LPR) {
+                kqmv_item r;
+                kqmv_decode<type>(wr, it, r);
+                accum(r);
             }
         }
 #pragma unroll
@@ -533,13 +679,19 @@ static void kqmv1_launch(const ggml_type type, const char * W, const char * Wg, 
         const float glu_limit = INFINITY) {
     static const int r_env = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MV1_R"); return e ? atoi(e) : 0; }();
     int R = r_env ? r_env : 1;
-    const int r_max = N >= 3 ? 2 : N == 2 ? 4 : 8;
+    // one token: R 4 beats 8 on giant rows (the 150k-row output head; 84.1 -> 84.6 t/s): more blocks, same
+    // per-row sums; smaller matrices keep their smaller R (M/(2R) < 2048 stops the growth)
+    // 3..4 tokens: R 2, except on the giant output head (Qwen3.8 248320 x 2560 at the MTP verify: R 4 and 16 blocks per
+    // CU in gcn_kq_mvs, 1884 -> 1671 us in test-backend-ops; same per-row sums, MTP output unchanged)
+    const bool huge = M >= 65536;
+    const int r_max = N >= 3 && !huge ? 2 : 4;
     while (!r_env && R < r_max && M/(2*R) >= 2048) {
         R *= 2;
     }
     const dim3 grid((unsigned) ((M + 4*R - 1)/(4*R)));
     static const int mvs_env = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MVS"); return e ? atoi(e) : 1; }();
-    static const int mvs_bpc = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MVS_BPC"); return e ? atoi(e) : 2; }();
+    static const int mvs_bpc_env = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MVS_BPC"); return e ? atoi(e) : 0; }();
+    const int mvs_bpc = mvs_bpc_env ? mvs_bpc_env : huge ? 16 : 2;
     const size_t mvs_lds = (size_t) N*(nsb*QK_K + (nsb*QK_K/QK8_1)*sizeof(half2));
     // large matrices only (>= 16M weights): on small ones the LDS copy costs more than it saves (2 tokens, q5_K: 4096 x 2048
     // 16.1 -> 17.3 us, 512 x 4096 6.4 -> 6.8; 2048 x 4096 15.3 -> 14.6)

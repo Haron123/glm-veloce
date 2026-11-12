@@ -3,6 +3,7 @@
 #include "moe-vec.cuh"
 #include "mmid.cuh"
 #include "vecdotq.cuh"
+#include "mmvq.cuh"
 #include "unary.cuh"
 
 // Grouped MUL_MAT_ID for few tokens per expert (GCN): the tokens are sorted by expert (mm_ids_helper), each
@@ -1209,7 +1210,20 @@ static __device__ __forceinline__ moe_iq_raw moe_iq_load(const char * __restrict
 // The kernels are bound by LDS and VALU work per item (gfx906 counters, gate at 1 token: ~76 VALU, ~14 LDS and ~3.4
 // VMEM instructions per 32 values), not by memory; computing the sign masks in registers instead of the LDS table
 // measured no gain (tg 61.3 -> 60.9 t/s).
-template <ggml_type type>
+// SR: the sign byte masks computed in registers instead of read from the sg table (the same bytes, so the same sums):
+// 4 sign bits spread to the byte LSBs by one 24-bit multiply (bits land at 0, 8, 16, 24 without carries), times 255 for
+// the 0xFF masks. 7-bit sign sets get bit 7 = their parity (as ksigns_iq2xs). The flat kernel is bound by its random LDS
+// gathers (grid + signs), so trading 8 sign gathers per gate/up pair for VALU can pay there (GGML_CUDA_MOE_IQ_FLAT_SREG).
+static __device__ __forceinline__ uint2 moe_sign_mask(const uint32_t s8, uint2 & t) {
+    t.x = __umul24(s8 & 0xF, 0x204081u) & 0x01010101u;
+    t.y = __umul24((s8 >> 4) & 0xF, 0x204081u) & 0x01010101u;
+    return make_uint2((t.x << 8) - t.x, (t.y << 8) - t.y);
+}
+static __device__ __forceinline__ uint32_t moe_sign7(const uint32_t s7) {
+    return s7 | ((__builtin_popcount(s7) & 1u) << 7);
+}
+
+template <ggml_type type, bool SR = false>
 static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const block_q8_1 * __restrict__ ys, const int it,
         const uint2 * __restrict__ g2, const uint32_t * __restrict__ g3, const uint2 * __restrict__ sg) {
     const block_q8_1 * yb = ys + it;
@@ -1221,9 +1235,17 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
         for (int k = 0; k < 4; ++k) {
             const uint32_t q = ((k < 2 ? r.a : r.b) >> (16*(k & 1))) & 0xFFFF;
             const uint2 g = g2[q & 0x1FF];
-            const uint2 m = sg[q >> 9];
-            const int v0 = (int) ((g.x ^ m.x) + (m.x & 0x01010101u));
-            const int v1 = (int) ((g.y ^ m.y) + (m.y & 0x01010101u));
+            int v0, v1;
+            if constexpr (SR) {
+                uint2 t;
+                const uint2 m = moe_sign_mask(moe_sign7(q >> 9), t);
+                v0 = (int) ((g.x ^ m.x) + t.x);
+                v1 = (int) ((g.y ^ m.y) + t.y);
+            } else {
+                const uint2 m = sg[q >> 9];
+                v0 = (int) ((g.x ^ m.x) + (m.x & 0x01010101u));
+                v1 = (int) ((g.y ^ m.y) + (m.y & 0x01010101u));
+            }
             s[k] = ggml_cuda_dp4a(v1, yq[2*k + 1], ggml_cuda_dp4a(v0, yq[2*k], 0));
         }
         const int si = (2*(int) (r.c & 0xF) + 1)*(s[0] + s[1]) + (2*(int) (r.c >> 4) + 1)*(s[2] + s[3]);
@@ -1243,9 +1265,17 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const uint2 g = g2[(r.a >> (8*k)) & 0xFF];
-            const uint2 m = sg[(r.b >> (7*k)) & 0x7F];
-            const int v0 = (int) ((g.x ^ m.x) + (m.x & 0x01010101u));
-            const int v1 = (int) ((g.y ^ m.y) + (m.y & 0x01010101u));
+            int v0, v1;
+            if constexpr (SR) {
+                uint2 t;
+                const uint2 m = moe_sign_mask(moe_sign7((r.b >> (7*k)) & 0x7F), t);
+                v0 = (int) ((g.x ^ m.x) + t.x);
+                v1 = (int) ((g.y ^ m.y) + t.y);
+            } else {
+                const uint2 m = sg[(r.b >> (7*k)) & 0x7F];
+                v0 = (int) ((g.x ^ m.x) + (m.x & 0x01010101u));
+                v1 = (int) ((g.y ^ m.y) + (m.y & 0x01010101u));
+            }
             s = ggml_cuda_dp4a(v1, yq[2*k + 1], ggml_cuda_dp4a(v0, yq[2*k], s));
         }
         return d*0.125f*__low2float(yb->ds)*(float) ((2*(int) (r.b >> 28) + 1)*s);
@@ -1256,9 +1286,17 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
             const uint32_t ii = k < 2 ? r.a : r.b;
             const uint32_t gl = g3[(ii >> (16*(k & 1)))     & 0xFF];
             const uint32_t gh = g3[(ii >> (16*(k & 1) + 8)) & 0xFF];
-            const uint2 m = sg[(r.c >> (7*k)) & 0x7F];
-            const int v0 = (int) ((gl ^ m.x) + (m.x & 0x01010101u));
-            const int v1 = (int) ((gh ^ m.y) + (m.y & 0x01010101u));
+            int v0, v1;
+            if constexpr (SR) {
+                uint2 t;
+                const uint2 m = moe_sign_mask(moe_sign7((r.c >> (7*k)) & 0x7F), t);
+                v0 = (int) ((gl ^ m.x) + t.x);
+                v1 = (int) ((gh ^ m.y) + t.y);
+            } else {
+                const uint2 m = sg[(r.c >> (7*k)) & 0x7F];
+                v0 = (int) ((gl ^ m.x) + (m.x & 0x01010101u));
+                v1 = (int) ((gh ^ m.y) + (m.y & 0x01010101u));
+            }
             s = ggml_cuda_dp4a(v1, yq[2*k + 1], ggml_cuda_dp4a(v0, yq[2*k], s));
         }
         return d*0.25f*__low2float(yb->ds)*(float) ((2*(int) (r.c >> 28) + 1)*s);
@@ -1301,10 +1339,18 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const uint2 g = g2[qs[l0/2] | ((qh << (8 - l0)) & 0x300)];
-            const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-            const int grid_l = __vsub4((int) g.x ^ signs0, signs0);
-            const int grid_h = __vsub4((int) g.y ^ signs1, signs1);
+            // sign byte -> byte masks; -v = (v ^ 0xFF) + 1 per byte (grid values are never 0, so no carry), as __vsub4
+            int grid_l, grid_h;
+            if constexpr (SR) {
+                uint2 t;
+                const uint2 m = moe_sign_mask(signs_packed_8[l0/2], t);
+                grid_l = (int) ((g.x ^ m.x) + t.x);
+                grid_h = (int) ((g.y ^ m.y) + t.y);
+            } else {
+                const uint2 m = sg[signs_packed_8[l0/2]];
+                grid_l = (int) ((g.x ^ m.x) + (m.x & 0x01010101u));
+                grid_h = (int) ((g.y ^ m.y) + (m.y & 0x01010101u));
+            }
             const int u0 = get_int_b4(yb->qs, l0 + 0);
             const int u1 = get_int_b4(yb->qs, l0 + 1);
             if (l0 < 4) {
@@ -1327,12 +1373,19 @@ static __device__ __forceinline__ float moe_iq_dot(const moe_iq_raw & r, const b
         int sumi = 0;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int gl = (int) g3[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
-            const int gh = (int) g3[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
-            const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-            const int grid_l = __vsub4(gl ^ signs0, signs0);
-            const int grid_h = __vsub4(gh ^ signs1, signs1);
+            const uint32_t gl = g3[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)];
+            const uint32_t gh = g3[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+            int grid_l, grid_h;
+            if constexpr (SR) {
+                uint2 t;
+                const uint2 m = moe_sign_mask(signs_packed_8[l0/2], t);
+                grid_l = (int) ((gl ^ m.x) + t.x);
+                grid_h = (int) ((gh ^ m.y) + t.y);
+            } else {
+                const uint2 m = sg[signs_packed_8[l0/2]]; // as iq2_s
+                grid_l = (int) ((gl ^ m.x) + (m.x & 0x01010101u));
+                grid_h = (int) ((gh ^ m.y) + (m.y & 0x01010101u));
+            }
             const int u0 = get_int_b4(yb->qs, l0 + 0);
             const int u1 = get_int_b4(yb->qs, l0 + 1);
             sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
@@ -1370,7 +1423,8 @@ static __global__ void moe_coal_iq(
     constexpr int  PF = MOE_IQ_PF;
     __shared__ uint2    g2[X2 ? 512 : XX ? 256 : I2S ? 1024 : 1];  // iq2xs_grid / iq2xxs_grid / iq2s_grid
     __shared__ uint32_t g3[X2 || I4 || XX || NL || Q20 || I2S ? 1 : I3S ? 512 : 256]; // iq3xxs_grid / iq3s_grid
-    __shared__ uint2    sg[I4 || NL || Q20 || I2S || I3S ? 1 : 128]; // ksigns_iq2xs expanded to byte masks (0x00 / 0xFF per value)
+    // ksigns_iq2xs expanded to byte masks (0x00 / 0xFF per value); iq2_s / iq3_s: every sign byte (direct sign bits)
+    __shared__ uint2    sg[I4 || NL || Q20 ? 1 : I2S || I3S ? 256 : 128];
     extern __shared__ int4 ys_raw[];
     block_q8_1 * ys = (block_q8_1 *) ys_raw;
 
@@ -1400,8 +1454,8 @@ static __global__ void moe_coal_iq(
             g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
         }
     }
-    if (!I4 && !NL && !Q20 && !I2S && !I3S && threadIdx.x < 128) {
-        const uint32_t s = ksigns_iq2xs[threadIdx.x];
+    if ((I2S || I3S || (!I4 && !NL && !Q20 && threadIdx.x < 128))) {
+        const uint32_t s = I2S || I3S ? threadIdx.x : ksigns_iq2xs[threadIdx.x];
         uint32_t lo = 0, hi = 0;
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
@@ -1489,7 +1543,7 @@ static __global__ void moe_coal_iq(
 // 1.5 waves per SIMD, latency bound (gfx906: the per-item work is ~76 VALU + ~14 LDS for 32 values). Here a grid of a
 // few blocks per CU stages once and walks (slot, row group) tasks with a block stride; LPR lanes per row (16 / 32: short
 // per-lane chains). GGML_CUDA_MOE_IQ_FLAT=0 off, GGML_CUDA_MOE_IQ_FLAT_LPR, GGML_CUDA_MOE_IQ_FLAT_BPC (blocks per CU).
-template <ggml_type type, bool GLU, int LPR>
+template <ggml_type type, bool GLU, int LPR, int PF, bool SR = false>
 __launch_bounds__(256)
 static __global__ void moe_coal_iq_flat(
         const char * __restrict__ vg, const char * __restrict__ vu, const block_q8_1 * __restrict__ vy, float * __restrict__ dst,
@@ -1503,11 +1557,10 @@ static __global__ void moe_coal_iq_flat(
     constexpr bool Q20 = type == GGML_TYPE_Q2_0;
     constexpr bool I2S = type == GGML_TYPE_IQ2_S;
     constexpr bool I3S = type == GGML_TYPE_IQ3_S;
-    constexpr int  PF = 2;
     constexpr int  RPT = 256/LPR; // rows per task
     __shared__ uint2    g2[X2 ? 512 : XX ? 256 : I2S ? 1024 : 1];
     __shared__ uint32_t g3[X2 || I4 || XX || NL || Q20 || I2S ? 1 : I3S ? 512 : 256];
-    __shared__ uint2    sg[I4 || NL || Q20 || I2S || I3S ? 1 : 128];
+    __shared__ uint2    sg[I4 || NL || Q20 ? 1 : I2S || I3S ? 256 : 128];
     extern __shared__ int4 ys_raw[];
     block_q8_1 * ys = (block_q8_1 *) ys_raw;
 
@@ -1535,8 +1588,8 @@ static __global__ void moe_coal_iq_flat(
             g3[threadIdx.x] = iq3xxs_grid[threadIdx.x];
         }
     }
-    if (!I4 && !NL && !Q20 && !I2S && !I3S && threadIdx.x < 128) {
-        const uint32_t sv = ksigns_iq2xs[threadIdx.x];
+    if (!SR && (I2S || I3S || (!I4 && !NL && !Q20 && threadIdx.x < 128))) {
+        const uint32_t sv = I2S || I3S ? threadIdx.x : ksigns_iq2xs[threadIdx.x];
         uint32_t lo = 0, hi = 0;
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
@@ -1599,9 +1652,9 @@ static __global__ void moe_coal_iq_flat(
             for (int p = 0; p < PF; ++p) {
                 const int it = it0 + p*LPR;
                 if (it < nyb) {
-                    ag += moe_iq_dot<type>(rgb[p], yt, it, g2, g3, sg);
+                    ag += moe_iq_dot<type, SR>(rgb[p], yt, it, g2, g3, sg);
                     if constexpr (GLU) {
-                        au += moe_iq_dot<type>(rub[p], yt, it, g2, g3, sg);
+                        au += moe_iq_dot<type, SR>(rub[p], yt, it, g2, g3, sg);
                     }
                 }
             }
@@ -2384,6 +2437,8 @@ static bool moe_iq_dec_ok(int cc, const ggml_tensor * src0, const ggml_tensor * 
     const int  al    = i4 ? 8 : 2; // iq4_xs loads qs as 8-byte pairs
     const bool new4  = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q2_0 ||
                        src0->type == GGML_TYPE_IQ2_S  || src0->type == GGML_TYPE_IQ3_S;
+    // 32 / 64-value blocks without super-blocks: K need not be a multiple of 256 (Flash-Next down, K = 640)
+    const int64_t k_mult = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q2_0 ? 64 : QK_K;
     // tokens per call (GGML_CUDA_MOE_IQ_DEC_MAX; the expert-grouped GEMM in gcn-q8-gemm.cu starts above 64): the per-slot
     // coalesced kernel beats the GEMM well past decode sizes. GLM-5.3 Q2 TP4 forward ms, GEMM -> here: 5 tokens 62.9 -> 32.5,
     // 8: 80.3 -> 45.1, 16: 120.9 -> 78.8, 32: 178.0 -> 141.3, 64: 229.0 -> 199.0, 96: 274.3 -> 268.4. iq2_xxs (DeepSeek V4,
@@ -2392,7 +2447,7 @@ static bool moe_iq_dec_ok(int cc, const ggml_tensor * src0, const ggml_tensor * 
     const int max_tok = env_max > 0 ? std::min(env_max, 256) : src0->type == GGML_TYPE_IQ2_XXS ? 32 : 64;
     return env && GGML_CUDA_CC_IS_GCN(cc) && (src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ3_XXS || (i4 && env4) ||
          (src0->type == GGML_TYPE_IQ2_XXS && envx) || (new4 && env2)) &&
-        src0->ne[0] % QK_K == 0 && src0->ne[0] <= 8192 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
+        src0->ne[0] % k_mult == 0 && src0->ne[0] <= 8192 && src0->ne[3] == 1 && ggml_is_contiguous(src0) &&
         src0->nb[1] % al == 0 && src0->nb[2] % al == 0 && ((uintptr_t) src0->data) % al == 0 &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
         dst->nb[0] == sizeof(float) && ids->nb[0] == sizeof(int32_t) && src1->ne[2] <= max_tok &&
@@ -2460,6 +2515,32 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     const int64_t n_used = ids->ne[0];
     const int64_t n_slots = ne12*n_used;
 
+    {
+        // GGML_CUDA_MOE_IDS_STATS=1 (debug, needs GGML_CUDA_DISABLE_GRAPHS=1: synchronous copy): distinct experts per
+        // 2..4-token call (the gate/up calls), printed every 500 calls
+        static const bool ids_stats = moe_vec_env("GGML_CUDA_MOE_IDS_STATS", 0) != 0;
+        static int64_t st_calls = 0, st_slots = 0, st_distinct = 0;
+        if (ids_stats && ne12 >= 2 && ne12 <= 4 && up_src0 != nullptr) {
+            std::vector<int32_t> h((ggml_nbytes(ids) + sizeof(int32_t) - 1)/sizeof(int32_t)); // a strided view: its span
+            CUDA_CHECK(cudaMemcpyAsync(h.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<int32_t> seen;
+            for (int64_t t = 0; t < ne12; ++t) {
+                for (int64_t k = 0; k < n_used; ++k) {
+                    const int32_t e = h[t*(ids->nb[1]/sizeof(int32_t)) + k];
+                    if (std::find(seen.begin(), seen.end(), e) == seen.end()) {
+                        seen.push_back(e);
+                    }
+                }
+            }
+            st_calls++; st_slots += ne12*n_used; st_distinct += (int64_t) seen.size();
+            if (st_calls % 500 == 0) {
+                fprintf(stderr, "moe ids stats: %lld calls, %.2f slots, %.2f distinct experts per call (%.1f%% of slots)\n",
+                    (long long) st_calls, (double) st_slots/st_calls, (double) st_distinct/st_calls, 100.0*st_distinct/st_slots);
+            }
+        }
+    }
+
     if (moe_iq_dec_ok(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, src0, src1, ids, dst) &&
             (!up_src0 || (up_src0->type == src0->type && src0->type != GGML_TYPE_IQ4_XS))) {
         const bool    bcast    = ne11 == 1;
@@ -2472,9 +2553,20 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         // projection) measured slower in the model, 61.5 -> 58.2 t/s (every block's weight stream starts later)
         const int64_t ne10_pad = GGML_PAD(ne00, 256);
         const int64_t s_col    = ne10_pad / QK8_1;
-        ggml_cuda_pool_alloc<block_q8_1> yd(ctx.pool(), (bcast ? ne12 : n_slots)*s_col);
-        moe_vec_quantize_gather<<<dim3((ne10_pad + 255)/256, bcast ? ne12 : n_slots), 256, 0, stream>>>((const float *) src1->data,
-            nullptr, yd.get(), ne00, ne10_pad, (bcast ? src1->nb[2] : src1->nb[1]) / sizeof(float));
+        // one activation row per token: the shared q8_1 copy (the same quants as here), which the shared expert's
+        // matvecs of the same input then reuse
+        ggml_cuda_pool_alloc<block_q8_1> yd_own(ctx.pool());
+        ggml_cuda_pool_alloc<char>       yd_cache(ctx.pool());
+        const block_q8_1 * yd_ptr;
+        if (bcast && src1->nb[2] == src1->ne[0]*sizeof(float) && ne10_pad == GGML_PAD(ne00, MATRIX_ROW_PADDING)) {
+            yd_ptr = (const block_q8_1 *) ggml_cuda_q8_1_activation(ctx, src1, src0->type, ne10_pad, yd_cache);
+        } else {
+            yd_own.alloc((bcast ? ne12 : n_slots)*s_col);
+            moe_vec_quantize_gather<<<dim3((ne10_pad + 255)/256, bcast ? ne12 : n_slots), 256, 0, stream>>>((const float *) src1->data,
+                nullptr, yd_own.get(), ne00, ne10_pad, (bcast ? src1->nb[2] : src1->nb[1]) / sizeof(float));
+            yd_ptr = yd_own.get();
+        }
+        struct { const block_q8_1 * p; const block_q8_1 * get() const { return p; } } yd = { yd_ptr };
         // GGML_CUDA_MOE_IQ_FLAT: 1 (default) the flat grid (1..2 tokens) for iq2_xs / iq3_xxs / iq4_xs (GLM-5.3 Q2 TP4 tg
         // 65.8 -> 67.6 t/s) but not iq2_xxs (DeepSeek V4: 43.1 -> 42.6-43.0), 2 every type, 0 off;
         // GGML_CUDA_MOE_IQ_FLAT_WHICH: 1 (default) the gate/up pair only (the down is neutral), 0 both, 2 the down only
@@ -2485,7 +2577,10 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         static const int flat_max_tok = moe_vec_env("GGML_CUDA_MOE_IQ_FLAT_MAX_TOK", 2); // GLM pp2 105.6 -> 107.2, pp4 153.2 -> 152.3
         if (flat_type && flat_which_ok && ne12 <= flat_max_tok && bcast && n_used <= 64) {
             static const int flat_lpr = moe_vec_env("GGML_CUDA_MOE_IQ_FLAT_LPR", 16);
-            static const int flat_bpc = moe_vec_env("GGML_CUDA_MOE_IQ_FLAT_BPC", 2);
+            // weight-load pipeline depth per lane; 1 = one item ahead (fewer registers: layer split tg +2%, 120 W), 2..4 more
+            static const int flat_pf = moe_vec_env("GGML_CUDA_MOE_IQ_FLAT_PF", 1);
+            // 4 (Qwen3.8 Flash-Next, 2x MI50: gate/up 43.4 -> 36.0 us per call; 2 was GLM-5.3's choice)
+            static const int flat_bpc = moe_vec_env("GGML_CUDA_MOE_IQ_FLAT_BPC", 4);
             const ggml_tensor * u = up_src0 ? up_src0 : src0;
             const size_t shm = (size_t) ne12*(ne00 / QK8_1)*sizeof(block_q8_1);
             const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
@@ -2496,8 +2591,14 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
                     (int) ne00, (int) ne01, src0->nb[1], src0->nb[2], u->nb[1], u->nb[2], (int) n_used, dst->nb[1] / sizeof(float), dr,
                     (int) ne12, dst->nb[2] / sizeof(float), s_col);
             };
-#define MOE_IQ_FLAT_L(t, glu) switch (flat_lpr) { case 8: go_flat(moe_coal_iq_flat<t, glu, 8>, 8); break; \
-            case 32: go_flat(moe_coal_iq_flat<t, glu, 32>, 32); break; default: go_flat(moe_coal_iq_flat<t, glu, 16>, 16); break; }
+            // GGML_CUDA_MOE_IQ_FLAT_SREG=1: sign masks in registers (moe_sign_mask), depth 1 only
+            static const int flat_sreg = moe_vec_env("GGML_CUDA_MOE_IQ_FLAT_SREG", 0);
+#define MOE_IQ_FLAT_GO(t, glu, l) if (flat_sreg && flat_pf == 1) { go_flat(moe_coal_iq_flat<t, glu, l, 1, true>, l); } else \
+            switch (flat_pf) { case 4: go_flat(moe_coal_iq_flat<t, glu, l, 4>, l); break; \
+            case 3: go_flat(moe_coal_iq_flat<t, glu, l, 3>, l); break; case 1: go_flat(moe_coal_iq_flat<t, glu, l, 1>, l); break; \
+            default: go_flat(moe_coal_iq_flat<t, glu, l, 2>, l); break; }
+#define MOE_IQ_FLAT_L(t, glu) switch (flat_lpr) { case 8: MOE_IQ_FLAT_GO(t, glu, 8); break; \
+            case 32: MOE_IQ_FLAT_GO(t, glu, 32); break; default: MOE_IQ_FLAT_GO(t, glu, 16); break; }
             if (src0->type == GGML_TYPE_IQ2_XS) {
                 if (up_src0) { MOE_IQ_FLAT_L(GGML_TYPE_IQ2_XS, true) } else { MOE_IQ_FLAT_L(GGML_TYPE_IQ2_XS, false) }
             } else if (src0->type == GGML_TYPE_IQ4_XS) {

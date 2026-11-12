@@ -1,4 +1,5 @@
 #include "fattn-sparse-gcn.cuh"
+#include "fattn.cuh"
 #include <vector>
 #include <algorithm>
 #include "fattn-tile.cuh"
@@ -99,7 +100,7 @@ static __global__ void __launch_bounds__(64) spg_gather(
         const int cap, const int n_pad, const int n_kvh, const int row_bytes, // bytes of one head's row
         const int64_t k_nb1, const int64_t k_nb2, const int64_t k_nb3,
         const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3, const int n_q, const int64_t s_mask_row,
-        const int64_t s_mask_seq, int * __restrict__ kv_max) {
+        const int64_t s_mask_seq, int * __restrict__ kv_max, const half * __restrict__ mval) {
     const int p   = blockIdx.x;
     const int seq = blockIdx.y;
     const int n   = min(count[seq], cap);
@@ -113,9 +114,9 @@ static __global__ void __launch_bounds__(64) spg_gather(
     }
     const bool valid = p < n;
     const int col = valid ? idx[(int64_t) seq*cap + p] : 0;
-    if (threadIdx.x < n_q) { // each query row keeps its own mask value
-        mg[((int64_t) seq*n_q + threadIdx.x)*n_pad + p] =
-            valid ? mask[seq*s_mask_seq + threadIdx.x*s_mask_row + col] : __float2half(-INFINITY);
+    if (threadIdx.x < n_q) { // each query row keeps its own mask value (mval: listed with the cells, one row)
+        mg[((int64_t) seq*n_q + threadIdx.x)*n_pad + p] = !valid ? __float2half(-INFINITY) :
+            mval ? mval[p] : mask[seq*s_mask_seq + threadIdx.x*s_mask_row + col];
     }
     const int words = row_bytes / 4;
     for (int h = 0; h < n_kvh; ++h) {
@@ -128,6 +129,166 @@ static __global__ void __launch_bounds__(64) spg_gather(
             vd[w] = vs[w];
         }
     }
+}
+
+// the same gather with 16-byte copies, one wave per row and 4 rows per block (K/V rows, heads and bases 16-byte aligned):
+// 2051 rows of 2 x 256 f16 heads at 64K context 34 -> ~15 us
+static __global__ void __launch_bounds__(256) spg_gather16(
+        const char * __restrict__ K, const char * __restrict__ V, const half * __restrict__ mask,
+        const int32_t * __restrict__ idx, const int32_t * __restrict__ count,
+        char * __restrict__ Kg, char * __restrict__ Vg, half * __restrict__ mg,
+        const int cap, const int n_pad, const int n_kvh, const int row_bytes,
+        const int64_t k_nb1, const int64_t k_nb2, const int64_t k_nb3,
+        const int64_t v_nb1, const int64_t v_nb2, const int64_t v_nb3, const int n_q, const int64_t s_mask_row,
+        const int64_t s_mask_seq, int * __restrict__ kv_max, const half * __restrict__ mval) {
+    const int lane = threadIdx.x % 64;
+    const int p    = blockIdx.x*4 + threadIdx.x/64;
+    const int seq  = blockIdx.y;
+    const int n    = min(count[seq], cap);
+    const int n_used = kv_max ? min(n_pad, ((n + 255)/256)*256) : n_pad;
+    if (p >= n_pad || (p >= n_used && p > 0)) {
+        return;
+    }
+    if (p == 0 && lane < 8 && kv_max) {
+        kv_max[seq*8 + lane] = max(n_used, 256);
+    }
+    const bool valid = p < n;
+    const int col = valid ? idx[(int64_t) seq*cap + p] : 0;
+    if (lane < n_q) {
+        mg[((int64_t) seq*n_q + lane)*n_pad + p] = !valid ? __float2half(-INFINITY) :
+            mval ? mval[p] : mask[seq*s_mask_seq + lane*s_mask_row + col];
+    }
+    const int w16   = row_bytes/16;      // 16-byte words of one head's row
+    const int total = 2*n_kvh*w16;       // K then V, all heads
+    for (int e = lane; e < total; e += 64) {
+        const int kv = e / (n_kvh*w16);
+        const int h  = (e / w16) % n_kvh;
+        const int w  = e % w16;
+        const char * src = kv == 0 ? K + (int64_t) col*k_nb1 + (int64_t) h*k_nb2 + (int64_t) seq*k_nb3
+                                   : V + (int64_t) col*v_nb1 + (int64_t) h*v_nb2 + (int64_t) seq*v_nb3;
+        char * dst = (kv == 0 ? Kg : Vg) + (((int64_t) seq*n_pad + p)*n_kvh + h)*row_bytes;
+        ((int4 *) dst)[w] = ((const int4 *) src)[w];
+    }
+}
+
+// decode (one query row, one sequence): the row list spg_compact would make from the masked row (hc_qsa_mask: the
+// selected cells keep their mask value, every other cell -inf), straight from the top-k: an LDS bitmap of the selected
+// cells with a mask value > -inf, then the same ordered expansion. The mask values are listed too: the attention mask
+// may be dead (its memory reused) by the time the attention runs.
+static __global__ void __launch_bounds__(1024) spg_list_topk(const int32_t * __restrict__ tk, const half * __restrict__ mask,
+        int32_t * __restrict__ idx, half * __restrict__ mval, int32_t * __restrict__ count, const int n_kv, const int width) {
+    extern __shared__ unsigned long long sb[];
+    __shared__ int s_wsum[16];
+    const int nwords = (n_kv + 63)/64;
+    for (int w = threadIdx.x; w < nwords; w += blockDim.x) {
+        sb[w] = 0ull;
+    }
+    __syncthreads();
+    // 8 entries per thread and pass, their loads issued together (the plain loop waited for each tk load and then for
+    // its mask load: ~16 serial round trips at width 8192)
+    for (int k0 = 0; k0 < width; k0 += 8*(int) blockDim.x) {
+        int c[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int k = k0 + j*(int) blockDim.x + (int) threadIdx.x;
+            c[j] = k < width ? tk[k] : -1;
+        }
+        float mv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const bool ok = c[j] >= 0 && c[j] < n_kv;
+            mv[j] = ok ? __half2float(mask[ok ? c[j] : 0]) : -INFINITY;
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (mv[j] > -INFINITY) {
+                atomicOr(&sb[c[j] >> 6], 1ull << (c[j] & 63));
+            }
+        }
+    }
+    __syncthreads();
+    const int lane = threadIdx.x % 64;
+    const int wave = threadIdx.x / 64;
+    int base = 0;
+    for (int w0 = 0; w0 < nwords; w0 += blockDim.x) {
+        const int w = w0 + threadIdx.x;
+        const unsigned long long word = w < nwords ? sb[w] : 0ull;
+        const int c = __popcll(word);
+        int incl = c;
+#pragma unroll
+        for (int off = 1; off < 64; off *= 2) {
+            const int v = __shfl_up(incl, off, 64);
+            incl += lane >= off ? v : 0;
+        }
+        if (lane == 63) {
+            s_wsum[wave] = incl;
+        }
+        __syncthreads();
+        int pos = base + incl - c;
+        int total = 0;
+        for (int j = 0; j < (int) (blockDim.x/64); ++j) {
+            pos   += j < wave ? s_wsum[j] : 0;
+            total += s_wsum[j];
+        }
+        for (unsigned long long m = word; m; m &= m - 1) {
+            idx[pos++] = w*64 + __builtin_ctzll(m);
+        }
+        base += total;
+        __syncthreads();
+    }
+    // the mask values in one parallel pass (a load per listed cell inside the loop above serialized up to 64 round trips
+    // per thread)
+    __threadfence_block();
+    __syncthreads();
+    for (int i0 = 0; i0 < base; i0 += 8*(int) blockDim.x) {
+        int c[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int i = i0 + j*(int) blockDim.x + (int) threadIdx.x;
+            c[j] = i < base ? idx[i] : 0;
+        }
+        half mv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            mv[j] = mask[c[j]];
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int i = i0 + j*(int) blockDim.x + (int) threadIdx.x;
+            if (i < base) {
+                mval[i] = mv[j];
+            }
+        }
+    }
+    if (threadIdx.x == 0) {
+        count[0] = base;
+        count[1] = 0;
+    }
+}
+
+bool ggml_cuda_spg_list_from_topk(ggml_backend_cuda_context & ctx, const ggml_tensor * fa, const int32_t * tk, int width,
+                                  const ggml_tensor * mask) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_SPG_LIST"); return !e || atoi(e) != 0; }();
+    if (!enabled || !ggml_cuda_flash_attn_ext_supported(ctx.device, fa) || !ggml_cuda_flash_attn_sparse_gcn_supported(fa)) {
+        return false;
+    }
+    const ggml_tensor * Q = fa->src[0];
+    const ggml_tensor * K = fa->src[1];
+    const int n_kv = (int) K->ne[1];
+    const int cap  = (int) std::min<int64_t>((int64_t) ggml_get_op_params_i32(fa, 4)*Q->ne[1], n_kv);
+    const size_t lds = (size_t) ((n_kv + 63)/64)*sizeof(unsigned long long);
+    if (Q->ne[1] != 1 || Q->ne[3] != 1 || width > cap || mask->type != GGML_TYPE_F16 || mask->ne[0] < n_kv || lds > 48*1024) {
+        return false;
+    }
+    auto & L = ctx.spg_list;
+    L.fa   = fa;
+    L.idx  = std::make_unique<ggml_cuda_pool_alloc<int32_t>>(ctx.pool(), (size_t) cap);
+    L.cnt  = std::make_unique<ggml_cuda_pool_alloc<int32_t>>(ctx.pool(), 2);
+    L.mval = std::make_unique<ggml_cuda_pool_alloc<half>>(ctx.pool(), (size_t) cap);
+    spg_list_topk<<<1, 1024, lds, ctx.stream()>>>(tk, (const half *) mask->data, L.idx->get(), L.mval->get(), L.cnt->get(),
+        n_kv, width);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 static int spg_env() {
@@ -164,6 +325,289 @@ bool ggml_cuda_flash_attn_sparse_gcn_supported(const ggml_tensor * dst) {
         ((uintptr_t) K->data) % 4 == 0 && ((uintptr_t) V->data) % 4 == 0;
 }
 
+// ---- decode attention over a row list (one query token, one sequence) ----
+// gather + tile kernel + combine cost ~58 us per layer for ~2K listed cells at long context (the tile kernel packs 4 of
+// the 12 GQA heads per block and has a fixed cost of ~15 us). Here a block takes one KV head (all its G query heads) and
+// SPD_C listed cells, reading the K rows through the list into LDS and the V rows straight from the cache: Q.K by
+// v_dot2_f32_f16 with Q*scale rounded to f16 (as the tile kernel), the softmax and P.V in f32. spd_combine then merges
+// the chunks in a fixed order (deterministic). GGML_CUDA_SPD=0 off.
+#define SPD_C 32
+#define SPD_D 256
+
+static __device__ __forceinline__ half2 spd_h2(const uint32_t v) {
+    return __builtin_bit_cast(half2, v);
+}
+
+template <int G>
+static __global__ void __launch_bounds__(256) spd_attn(
+        const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
+        const int32_t * __restrict__ idx, const half * __restrict__ mval, const half * __restrict__ mask_row,
+        const int32_t * __restrict__ cnt, const int n_dense, const float scale, const int64_t q_nb2,
+        const int64_t k_nb1, const int64_t k_nb2, const int64_t v_nb1, const int64_t v_nb2,
+        float2 * __restrict__ part_ml, float * __restrict__ part_acc) {
+    constexpr int D2 = SPD_D/2;
+    constexpr int C  = SPD_C;
+    constexpr int DH = D2/2;            // K is staged in two halves of D (~16 KB of LDS: 3 blocks per CU)
+    constexpr int KS = DH + 4;          // padded LDS row (half2, 16-byte aligned): 16-byte reads of 8 lanes hit distinct banks
+    constexpr int NQ = G*D2/256;        // Q half2 per thread
+    constexpr int GP = (G + 3)/4*4;     // ps row, 16-byte reads
+    constexpr int B_QH = G*D2*4, B_KS = C*KS*4, B_PS = C*GP*4, B_RED = G*SPD_D*4;
+    constexpr int B_ALL = B_QH + B_KS + B_PS > B_RED ? B_QH + B_KS + B_PS : B_RED;
+    static_assert(C*8 == 256 && G % 4 == 0 && C*(G/2) <= 256 && (G*D2) % 256 == 0, "spd_attn layout");
+    __shared__ __align__(16) char lds[B_ALL];
+    half2 (*qh)[D2] = (half2 (*)[D2]) lds;
+    half2 (*ks)[KS] = (half2 (*)[KS]) (lds + B_QH);
+    float (*ps)[GP] = (float (*)[GP]) (lds + B_QH + B_KS);
+    float * red     = (float *) lds;    // the P.V halves, after everything above is consumed
+    __shared__ int   sc[C];
+    __shared__ float sm[C];
+
+    const int tid = threadIdx.x;
+    const int ch  = blockIdx.x;
+    const int g   = blockIdx.y;
+    const int n   = idx ? cnt[0] : n_dense;
+    const int c0  = ch*C;
+    float2 * ml      = part_ml + ((int64_t) g*gridDim.x + ch)*G;
+    float  * acc_out = part_acc + ((int64_t) g*gridDim.x + ch)*G*SPD_D;
+    if (c0 >= n) {
+        if (tid < G) {
+            ml[tid] = make_float2(-INFINITY, 0.0f);
+        }
+        return;
+    }
+
+    // Q loads first (independent of the list), the list entries and their mask values meanwhile
+    float2 qv[NQ];
+#pragma unroll
+    for (int j = 0; j < NQ; ++j) {
+        const int e = tid + 256*j;
+        qv[j] = *(const float2 *) (Q + (int64_t) (g*G + e/D2)*q_nb2 + 2*(e % D2));
+    }
+    if (tid < C) {
+        const int  i     = c0 + tid;
+        const bool valid = i < n;
+        const int  col   = idx ? idx[valid ? i : c0] : (valid ? i : c0);
+        sc[tid] = col;
+        sm[tid] = valid ? __half2float(mval ? mval[i] : mask_row[col]) : -INFINITY;
+    }
+#pragma unroll
+    for (int j = 0; j < NQ; ++j) {
+        const int e = tid + 256*j;
+        qh[e/D2][e % D2] = __floats2half2_rn(qv[j].x*scale, qv[j].y*scale);
+    }
+    __syncthreads();
+
+    // K rows of the chunk (8 threads per cell, 32 bytes of each D half) and this thread's V values (dim pair d2, every
+    // other cell from ph), all in flight before the scores
+    const int d2 = tid % D2, ph = tid / D2;
+    const int ki = tid / 8, kp = tid % 8;
+    const char * ksrc = K + (int64_t) sc[ki]*k_nb1 + (int64_t) g*k_nb2 + 32*kp;
+    const uint4 kw0 = ((const uint4 *) ksrc)[0];
+    const uint4 kw1 = ((const uint4 *) ksrc)[1];
+    const uint4 kw2 = ((const uint4 *) (ksrc + 4*DH))[0];
+    const uint4 kw3 = ((const uint4 *) (ksrc + 4*DH))[1];
+    half2 vv[C/2];
+#pragma unroll
+    for (int j = 0; j < C/2; ++j) {
+        vv[j] = *(const half2 *) (V + (int64_t) sc[ph + 2*j]*v_nb1 + (int64_t) g*v_nb2 + 4*d2);
+    }
+
+    // scores: thread (cell si, head pair hp), the two D halves in turn
+    const int si = tid % C, hp = tid / C;
+    float a0 = 0.0f, a1 = 0.0f;
+    const auto score_half = [&](const int hf) {
+        if (tid < C*(G/2)) {
+#pragma unroll 4
+            for (int k = 0; k < DH; k += 4) {
+                const uint4 kq = *(const uint4 *) &ks[si][k];
+                const uint4 q0 = *(const uint4 *) &qh[2*hp][DH*hf + k];
+                const uint4 q1 = *(const uint4 *) &qh[2*hp + 1][DH*hf + k];
+                const uint32_t kk[4] = { kq.x, kq.y, kq.z, kq.w };
+                const uint32_t qa[4] = { q0.x, q0.y, q0.z, q0.w };
+                const uint32_t qb[4] = { q1.x, q1.y, q1.z, q1.w };
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    ggml_cuda_mad(a0, spd_h2(kk[u]), spd_h2(qa[u]));
+                    ggml_cuda_mad(a1, spd_h2(kk[u]), spd_h2(qb[u]));
+                }
+            }
+        }
+    };
+    *(uint4 *) &ks[ki][8*kp]     = kw0;
+    *(uint4 *) &ks[ki][8*kp + 4] = kw1;
+    __syncthreads();
+    score_half(0);
+    __syncthreads(); // every score thread is done with the first half
+    *(uint4 *) &ks[ki][8*kp]     = kw2;
+    *(uint4 *) &ks[ki][8*kp + 4] = kw3;
+    __syncthreads();
+    score_half(1);
+    if (tid < C*(G/2)) {
+        ps[si][2*hp]     = a0 + sm[si];
+        ps[si][2*hp + 1] = a1 + sm[si];
+    }
+    __syncthreads();
+
+    // softmax over the chunk per head: one wave per head (cells on lanes)
+    for (int h = tid / 64; h < G; h += 4) {
+        const int lane = tid % 64;
+        const float s = lane < C ? ps[lane][h] : -INFINITY;
+        const float m = warp_reduce_max<64>(s);
+        const float p = m == -INFINITY ? 0.0f : expf(s - m);
+        const float l = warp_reduce_sum<64>(p);
+        if (lane < C) {
+            ps[lane][h] = p;
+        }
+        if (lane == 0) {
+            ml[h] = make_float2(m, l);
+        }
+    }
+    __syncthreads();
+
+    // P.V (invalid cells have p = 0)
+    float ax[G], ay[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+        ax[h] = 0.0f;
+        ay[h] = 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < C/2; ++j) {
+        const int i = ph + 2*j;
+        const float2 v = __half22float2(vv[j]);
+#pragma unroll
+        for (int h4 = 0; h4 < G; h4 += 4) {
+            const float4 p4 = *(const float4 *) &ps[i][h4];
+            ax[h4 + 0] = fmaf(p4.x, v.x, ax[h4 + 0]); ay[h4 + 0] = fmaf(p4.x, v.y, ay[h4 + 0]);
+            ax[h4 + 1] = fmaf(p4.y, v.x, ax[h4 + 1]); ay[h4 + 1] = fmaf(p4.y, v.y, ay[h4 + 1]);
+            ax[h4 + 2] = fmaf(p4.z, v.x, ax[h4 + 2]); ay[h4 + 2] = fmaf(p4.z, v.y, ay[h4 + 2]);
+            ax[h4 + 3] = fmaf(p4.w, v.x, ax[h4 + 3]); ay[h4 + 3] = fmaf(p4.w, v.y, ay[h4 + 3]);
+        }
+    }
+    __syncthreads(); // red overlays qh / ks / ps
+    if (ph == 1) {
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            *(float2 *) &red[h*SPD_D + 2*d2] = make_float2(ax[h], ay[h]);
+        }
+    }
+    __syncthreads();
+    if (ph == 0) {
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const float2 r = *(const float2 *) &red[h*SPD_D + 2*d2];
+            *(float2 *) (acc_out + h*SPD_D + 2*d2) = make_float2(ax[h] + r.x, ay[h] + r.y);
+        }
+    }
+}
+
+// one block per query head: wave w sums chunks w, w + 4, ... (4 output values per lane, 8 chunks' loads at a time), the
+// four wave sums are then added in order (deterministic)
+#define SPD_MAXCH 1024
+template <int G>
+static __global__ void __launch_bounds__(256) spd_combine(const float2 * __restrict__ part_ml, const float * __restrict__ part_acc,
+        float * __restrict__ dst, const int nch) {
+    __shared__ float2 s_ml[SPD_MAXCH];
+    __shared__ float  s_m;
+    __shared__ float4 s_acc[4][SPD_D/4];
+    __shared__ float  s_l[4];
+    const int hq = blockIdx.x, g = hq / G, h = hq % G;
+    const int tid = threadIdx.x, wave = tid / 64, lane = tid % 64;
+    for (int c = tid; c < nch; c += 256) {
+        s_ml[c] = part_ml[((int64_t) g*nch + c)*G + h];
+    }
+    __syncthreads();
+    if (wave == 0) {
+        float m = -INFINITY;
+        for (int c = lane; c < nch; c += 64) {
+            m = fmaxf(m, s_ml[c].x);
+        }
+        m = warp_reduce_max<64>(m);
+        if (lane == 0) {
+            s_m = m;
+        }
+    }
+    __syncthreads();
+    const float M = s_m;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  L   = 0.0f;
+    if (M > -INFINITY) {
+        const float4 * pa = (const float4 *) (part_acc + ((int64_t) g*nch*G + h)*SPD_D) + lane;
+        for (int c0 = wave; c0 < nch; c0 += 32) {
+            float4 a[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int c = c0 + 4*u;
+                a[u] = c < nch ? pa[(int64_t) c*G*(SPD_D/4)] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int c = c0 + 4*u;
+                if (c < nch) {
+                    const float2 v = s_ml[c];
+                    const float  w = v.x == -INFINITY ? 0.0f : expf(v.x - M);
+                    L += w*v.y;
+                    acc.x += w*a[u].x; acc.y += w*a[u].y; acc.z += w*a[u].z; acc.w += w*a[u].w;
+                }
+            }
+        }
+    }
+    s_acc[wave][lane] = acc;
+    if (lane == 0) {
+        s_l[wave] = L;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        float4 t = s_acc[0][lane];
+        float  l = s_l[0];
+#pragma unroll
+        for (int w = 1; w < 4; ++w) {
+            const float4 o = s_acc[w][lane];
+            t.x += o.x; t.y += o.y; t.z += o.z; t.w += o.w;
+            l += s_l[w];
+        }
+        const float il = l > 0.0f ? 1.0f/l : 0.0f;
+        ((float4 *) (dst + (int64_t) hq*SPD_D))[lane] = make_float4(t.x*il, t.y*il, t.z*il, t.w*il);
+    }
+}
+
+// Q [D, 1, n_head, 1] f32, K/V f16 [D, n_kv, n_kvh, 1], dst [D, n_head, 1, 1]; the list (idx, mval, cnt) or the dense
+// prefix of n_dense cells with mask_row. Returns false if the shape is not covered (caller falls back).
+static bool spd_attn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int32_t * idx, const half * mval,
+                            const half * mask_row, const int32_t * cnt, const int cap, const int n_dense) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_SPD"); return !e || atoi(e) != 0; }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    float scale, max_bias, softcap;
+    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    const int n_kvh = (int) K->ne[2];
+    const int G = n_kvh > 0 ? (int) (Q->ne[2] / n_kvh) : 0;
+    if (!enabled || G != 12 || Q->ne[0] != SPD_D || K->ne[0] != SPD_D || V->ne[0] != SPD_D || Q->ne[1] != 1 || Q->ne[3] != 1 ||
+            Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || Q->nb[0] != sizeof(float) ||
+            Q->nb[2] % 8 != 0 || ((uintptr_t) Q->data) % 8 != 0 || K->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 ||
+            ((uintptr_t) K->data) % 16 != 0 || V->nb[1] % 4 != 0 || V->nb[2] % 4 != 0 || ((uintptr_t) V->data) % 4 != 0 ||
+            max_bias != 0.0f || softcap != 0.0f || dst->src[4] != nullptr || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            dst->ne[0] != SPD_D || dst->ne[1] != Q->ne[2]) {
+        return false;
+    }
+    const int nch = (cap + SPD_C - 1)/SPD_C;
+    if (nch > SPD_MAXCH) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<float2> ml(ctx.pool(), (size_t) n_kvh*nch*G);
+    ggml_cuda_pool_alloc<float>  acc(ctx.pool(), (size_t) n_kvh*nch*G*SPD_D);
+    cudaStream_t stream = ctx.stream();
+    spd_attn<12><<<dim3(nch, n_kvh), 256, 0, stream>>>((const float *) Q->data, (const char *) K->data, (const char *) V->data,
+        idx, mval, mask_row, cnt, n_dense, scale, Q->nb[2]/sizeof(float), K->nb[1], K->nb[2], V->nb[1], V->nb[2], ml.get(), acc.get());
+    CUDA_CHECK(cudaGetLastError());
+    spd_combine<12><<<(int) Q->ne[2], 256, 0, stream>>>(ml.get(), acc.get(), (float *) dst->data, nch);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void ggml_cuda_flash_attn_sparse_gcn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -181,10 +625,20 @@ void ggml_cuda_flash_attn_sparse_gcn(ggml_backend_cuda_context & ctx, ggml_tenso
     const int64_t s_mask_seq = mask->ne[3] == 1 ? 0 : mask->nb[3] / sizeof(half);
 
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<int32_t> idx(ctx.pool(), (size_t) n_seq*cap);
-    ggml_cuda_pool_alloc<int32_t> cnt(ctx.pool(), 2*n_seq); // [count per sequence, finished-block ticket per sequence]
+    // the row list may come from the indexer top-k (ggml_cuda_spg_list_from_topk): then the masked row was never written
+    const bool pre = ctx.spg_list.fa == dst;
+    ggml_cuda_pool_alloc<int32_t> idx_l(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> cnt_l(ctx.pool()); // [count per sequence, finished-block ticket per sequence]
     const int n_blk = (n_kv + 255)/256;
-    ggml_cuda_pool_alloc<unsigned long long> bits(ctx.pool(), (size_t) n_seq*n_blk*4);
+    ggml_cuda_pool_alloc<unsigned long long> bits(ctx.pool());
+    if (!pre) {
+        idx_l.alloc((size_t) n_seq*cap);
+        cnt_l.alloc(2*n_seq);
+        bits.alloc((size_t) n_seq*n_blk*4);
+    }
+    int32_t    * idx_p  = pre ? ctx.spg_list.idx->get()  : idx_l.get();
+    int32_t    * cnt_p  = pre ? ctx.spg_list.cnt->get()  : cnt_l.get();
+    const half * mval_p = pre ? ctx.spg_list.mval->get() : nullptr;
     ggml_cuda_pool_alloc<char>    kg(ctx.pool(), (size_t) n_seq*n_pad*n_kvh*row_bytes);
     ggml_cuda_pool_alloc<char>    vg(ctx.pool(), (size_t) n_seq*n_pad*n_kvh*row_bytes);
     ggml_cuda_pool_alloc<half>    mg(ctx.pool(), (size_t) n_seq*n_q*n_pad);
@@ -192,20 +646,37 @@ void ggml_cuda_flash_attn_sparse_gcn(ggml_backend_cuda_context & ctx, ggml_tenso
     static const bool use_kvmax = [] { const char * e = getenv("GGML_CUDA_FA_SPARSE_KVMAX"); return !e || atoi(e) != 0; }();
     int * kv_max = use_kvmax && n_seq == 1 ? kvm.get() : nullptr; // entries are [query tile] of sequence 0
 
-    CUDA_CHECK(cudaMemsetAsync(cnt.get(), 0, 2*n_seq*sizeof(int32_t), stream));
-    spg_compact<<<dim3(n_blk, n_seq), 256, 0, stream>>>((const half *) mask->data, idx.get(), cnt.get(), bits.get(), n_kv, cap,
-        n_q, s_mask_row, s_mask_seq);
-    spg_gather<<<dim3(n_pad, n_seq), 64, 0, stream>>>((const char *) K->data, (const char *) V->data, (const half *) mask->data,
-        idx.get(), cnt.get(), kg.get(), vg.get(), mg.get(), cap, n_pad, n_kvh, row_bytes,
-        K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], n_q, s_mask_row, s_mask_seq, kv_max);
+    if (!pre) {
+        CUDA_CHECK(cudaMemsetAsync(cnt_p, 0, 2*n_seq*sizeof(int32_t), stream));
+        spg_compact<<<dim3(n_blk, n_seq), 256, 0, stream>>>((const half *) mask->data, idx_p, cnt_p, bits.get(), n_kv, cap,
+            n_q, s_mask_row, s_mask_seq);
+    }
+    if (n_seq == 1 && n_q == 1 && spd_attn_launch(ctx, dst, idx_p, mval_p, (const half *) mask->data, cnt_p, cap, 0)) {
+        if (pre) {
+            ctx.spg_list = {};
+        }
+        return;
+    }
+    const bool a16 = row_bytes % 16 == 0 && K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && K->nb[3] % 16 == 0 &&
+        V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0 && V->nb[3] % 16 == 0 && ((uintptr_t) K->data) % 16 == 0 &&
+        ((uintptr_t) V->data) % 16 == 0 && n_q <= 64;
+    if (a16) {
+        spg_gather16<<<dim3((n_pad + 3)/4, n_seq), 256, 0, stream>>>((const char *) K->data, (const char *) V->data,
+            (const half *) mask->data, idx_p, cnt_p, kg.get(), vg.get(), mg.get(), cap, n_pad, n_kvh, row_bytes,
+            K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], n_q, s_mask_row, s_mask_seq, kv_max, mval_p);
+    } else {
+        spg_gather<<<dim3(n_pad, n_seq), 64, 0, stream>>>((const char *) K->data, (const char *) V->data, (const half *) mask->data,
+            idx_p, cnt_p, kg.get(), vg.get(), mg.get(), cap, n_pad, n_kvh, row_bytes,
+            K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], n_q, s_mask_row, s_mask_seq, kv_max, mval_p);
+    }
     CUDA_CHECK(cudaGetLastError());
     static int dbg_left = [] { const char * e = getenv("GGML_CUDA_FA_SPARSE_DBG"); return e ? atoi(e) : 0; }();
     if (dbg_left > 0) {
         dbg_left--;
         int c = 0;
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaMemcpy(&c, cnt.get(), sizeof(int), cudaMemcpyDeviceToHost));
-        fprintf(stderr, "spg: n_q %d n_kv %d cap %d union %d\n", n_q, n_kv, cap, c);
+        CUDA_CHECK(cudaMemcpy(&c, cnt_p, sizeof(int), cudaMemcpyDeviceToHost));
+        fprintf(stderr, "spg: n_q %d n_kv %d cap %d union %d%s\n", n_q, n_kv, cap, c, pre ? " (top-k list)" : "");
     }
 
     // the gathered tensors: cell-major like the cache ([D, n_pad, n_kvh, n_seq], heads of a cell adjacent)
@@ -238,6 +709,9 @@ void ggml_cuda_flash_attn_sparse_gcn(ggml_backend_cuda_context & ctx, ggml_tenso
     ggml_cuda_fattn_kv_max_override = kv_max;
     ggml_cuda_flash_attn_ext_tile(ctx, &dst2);
     ggml_cuda_fattn_kv_max_override = nullptr;
+    if (pre) {
+        ctx.spg_list = {}; // back to the pool, after the last use was queued
+    }
 }
 
 // ---- prefill ----

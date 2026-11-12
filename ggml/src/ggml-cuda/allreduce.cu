@@ -369,6 +369,87 @@ static __global__ void ggml_cuda_ar_p2p_kernel(
     }
 }
 
+// Graph-safe variant of the P2P push kernel for a whole decode step captured as one graph per GPU (the meta backend's
+// AllReduce chain, ggml_cuda_ar_chain_launch): the token comes from a per-GPU counter in device memory instead of a host
+// argument, so a replayed graph carries no stale tokens. Both GPUs run the same chain, so their counters advance in
+// lockstep. seq[0] = AllReduces done, seq[1] = blocks finished in the current one (the last block advances seq[0], after
+// every block has read it). Own inbox / flags (separate from the host-token path above). Same arithmetic as that kernel
+// (own + peer), so the mirrored results stay bit identical.
+static __global__ void ggml_cuda_ar_chain_kernel(
+        float        *              data,
+        float        * __restrict__ inbox_peer_base,
+        const float  * __restrict__ inbox_mine_base,
+        int                         count,
+        int          *              flag_peer,
+        const int    *              flag_mine,
+        unsigned int *              seq,
+        size_t                      half_elems,
+        int                         spin) {
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(float);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+    const int tid = threadIdx.x, bid = blockIdx.x;
+    const int gtid = bid*blockDim.x + tid, gnt = gridDim.x*blockDim.x;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+    const int token = (int) (*(volatile unsigned int *) seq + 1u);
+    float       * inbox_peer = inbox_peer_base + (size_t) (token & 1) * half_elems;
+    const float * inbox_mine = inbox_mine_base + (size_t) (token & 1) * half_elems;
+
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        float wire[ELEMS_PER_VEC];
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            wire[k] = data[off + k];
+        }
+        ggml_cuda_memcpy_1<sizeof(wire)>(&inbox_peer[off], wire);
+    }
+    if (bid == 0 && tid < count - tail) {
+        inbox_peer[tail + tid] = data[tail + tid];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(flag_peer + bid*ARRIVAL_INTS, token);
+        __threadfence_system();
+    }
+    // spin 0: thread 0 polls with a sleep; 1: it polls without a sleep; 2: every thread polls (the wait then counts as
+    // GPU activity for the clock governor)
+    if (tid == 0 || spin == 2) {
+        while (ggml_cuda_ar_signal_get(flag_mine + bid*ARRIVAL_INTS) - token < 0) {
+            if (spin == 0) {
+#ifdef GGML_USE_HIP
+                __builtin_amdgcn_s_sleep(1);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(50);
+#endif
+            }
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        float wire[ELEMS_PER_VEC];
+        ggml_cuda_memcpy_1<sizeof(wire)>(wire, &inbox_mine[off]);
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            data[off + k] = data[off + k] + wire[k];
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        data[tail + tid] = data[tail + tid] + inbox_mine[tail + tid];
+    }
+    if (tid == 0) {
+        __threadfence();
+        if (atomicAdd(&seq[1], 1u) == gridDim.x - 1) {
+            seq[1] = 0;
+            __threadfence();
+            *(volatile unsigned int *) &seq[0] = (unsigned int) token;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
@@ -393,6 +474,8 @@ static constexpr int GGML_CUDA_AR_WIDE_MAX_ROUNDS = 16;
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
 // Larger tensors are reduced by issuing multiple chunked launches.
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
+// chain AllReduce: largest tensor (bytes, F32) one inbox half takes (decode steps: <= a few tokens x the hidden size)
+static constexpr size_t GGML_CUDA_AR_CHAIN_HALF_BYTES = 1024 * 1024;
 
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
@@ -482,6 +565,11 @@ struct ggml_cuda_ar_pipeline {
     size_t                   p2p_bytes = 0;
     char *                   p2p_inbox[GGML_CUDA_MAX_DEVICES] = {};
     int *                    p2p_flag[GGML_CUDA_MAX_DEVICES] = {};
+    // graph-safe chain AllReduce (decode steps captured as one graph): own inbox (2 halves), flags and device counters
+    bool                     chain = false;
+    char *                   chain_inbox[GGML_CUDA_MAX_DEVICES] = {};
+    int *                    chain_flag[GGML_CUDA_MAX_DEVICES] = {};
+    unsigned int *           chain_seq[GGML_CUDA_MAX_DEVICES] = {};
 
     // Copy-engine: per-device "I finished reading my peer's host_large"
     // event.  Indexed by RECORDER device.  Recorded same-device on streams[i]
@@ -740,6 +828,17 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                  cudaMemset(p->p2p_flag[i], 0, flag_bytes) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
         }
         p->p2p = ok;
+        // chain AllReduce buffers (GGML_CUDA_AR_CHAIN=0: none, the meta backend keeps launching AllReduces between graphs)
+        bool chain_ok = ok && ggml_cuda_ar_env_u64("GGML_CUDA_AR_CHAIN", 1) != 0;
+        for (int i = 0; chain_ok && i < 2; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            chain_ok = hipExtMallocWithFlags((void **) &p->chain_inbox[i], 2*GGML_CUDA_AR_CHAIN_HALF_BYTES, hipDeviceMallocUncached) == hipSuccess &&
+                       hipExtMallocWithFlags((void **) &p->chain_flag[i], flag_bytes, hipDeviceMallocUncached) == hipSuccess &&
+                       cudaMalloc((void **) &p->chain_seq[i], 2*sizeof(unsigned int)) == cudaSuccess &&
+                       cudaMemset(p->chain_flag[i], 0, flag_bytes) == cudaSuccess &&
+                       cudaMemset(p->chain_seq[i], 0, 2*sizeof(unsigned int)) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+        }
+        p->chain = chain_ok;
         // the P2P path is link-bandwidth bound for large tensors, so the BF16 wire pays there (2+2 pp3200 1899 -> 1973;
         // KLD vs layer mode 0.0244 -> 0.0269, within the 0.025 that a ubatch-size change alone gives); small tensors
         // (decode) stay F32
@@ -803,6 +902,9 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         ggml_cuda_set_device(p->devices[i]);
         if (p->p2p_inbox[i]) { CUDA_CHECK(cudaFree(p->p2p_inbox[i])); }
         if (p->p2p_flag[i])  { CUDA_CHECK(cudaFree(p->p2p_flag[i])); }
+        if (p->chain_inbox[i]) { CUDA_CHECK(cudaFree(p->chain_inbox[i])); }
+        if (p->chain_flag[i])  { CUDA_CHECK(cudaFree(p->chain_flag[i])); }
+        if (p->chain_seq[i])   { CUDA_CHECK(cudaFree(p->chain_seq[i])); }
     }
     p->arrival.free();
     p->wide_arrival.free();
@@ -1307,6 +1409,27 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
+bool ggml_cuda_ar_chain_eligible(const ggml_cuda_ar_pipeline * p, const ggml_tensor * t) {
+    // F32 wire like the host-token path below its BF16 threshold (identical results; larger tensors keep that path)
+    if (!p || !p->chain || !t) {
+        return false;
+    }
+    const size_t nb = ggml_nbytes(t);
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(t) && ((uintptr_t) t->data & 0xF) == 0 &&
+        (t->flags & GGML_TENSOR_FLAG_COMPUTE) && nb > 0 && nb <= GGML_CUDA_AR_CHAIN_HALF_BYTES &&
+        (p->bf16_threshold == 0 || nb < p->bf16_threshold);
+}
+
+void ggml_cuda_ar_chain_launch(ggml_cuda_ar_pipeline * p, int rank, ggml_tensor * t, cudaStream_t stream) {
+    static const int blocks = (int) std::min<uint64_t>(GGML_CUDA_AR_WIDE_MAX_BLOCKS, ggml_cuda_ar_env_u64("GGML_CUDA_AR_P2P_SMALL_BLOCKS", 16));
+    static const int spin = (int) ggml_cuda_ar_env_u64("GGML_CUDA_AR_CHAIN_SPIN", 0);
+    const int peer = 1 - rank;
+    ggml_cuda_ar_chain_kernel<<<blocks, 256, 0, stream>>>((float *) t->data, (float *) p->chain_inbox[peer],
+        (const float *) p->chain_inbox[rank], (int) ggml_nelements(t), p->chain_flag[peer], p->chain_flag[rank],
+        p->chain_seq[rank], GGML_CUDA_AR_CHAIN_HALF_BYTES/sizeof(float), spin);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 #else // defined(GGML_USE_MUSA)
 
 // MUSA lacks the host-mapped pinned-memory APIs (cudaHostAllocPortable
@@ -1322,6 +1445,11 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
+}
+bool ggml_cuda_ar_chain_eligible(const ggml_cuda_ar_pipeline *, const ggml_tensor *) {
+    return false;
+}
+void ggml_cuda_ar_chain_launch(ggml_cuda_ar_pipeline *, int, ggml_tensor *, cudaStream_t) {
 }
 
 #endif // !defined(GGML_USE_MUSA)

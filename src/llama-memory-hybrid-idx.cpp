@@ -7,6 +7,7 @@
 
 
 #include <algorithm>
+#include <cstring>
 #include <cassert>
 #include <cmath>
 #include <iterator>
@@ -16,11 +17,14 @@
 // llama_memory_hybrid_idx
 //
 
+// the pooled-key cache (default on, LLAMA_QSA_KPOOL=0 off): each block's pooled key is computed once and read from
+// the cache at decode instead of re-pooled every token. Stored in f16, so rounding-class: 8K-window PPL on code 1.2077
+// vs 1.2078; tg at 64K context 45.6 -> 49.0 t/s with the flat inputs and the fused score (2x MI50, 150 W)
 bool llama_qsa_kpool_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_QSA_KPOOL");
 
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;
     }();
 
     return enabled;
@@ -63,7 +67,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const uint32_t n_head_kv = llama_qsa_kpool_enabled() ? 2 : 1;
 
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), n_head_kv);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        // pooled-key cache: each head is padded by 16 values, so the pooled keys (one per `ratio` cells, 4: 2304 B apart
+        // instead of 2048) do not all map to the same HBM channels. gfx906: 16384 pooled rows read in ~8 us instead of ~43
+        // (LLAMA_QSA_KPOOL_PAD: the pad, default 16)
+        static const int kpool_pad = [] { const char * e = getenv("LLAMA_QSA_KPOOL_PAD"); return e ? atoi(e) : 16; }();
+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size + (llama_qsa_kpool_enabled() ? kpool_pad : 0);
 
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
@@ -392,11 +400,24 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(r <= 64);
     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
-    // TODO: this runs per ubatch and is O(n_kv) per stream, about 865 us at 33k context. the cost
-    //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
-    std::vector<int32_t>  blk_of(n_kv);
-    std::vector<int32_t>  cell_grp(n_kv);
-    std::vector<int32_t>  grp_head(n_blocks);
+    // block and slot of a (non-negative) position: shift and mask for a power-of-two ratio. 64-bit division costs
+    // ~60 cycles here and the scans below did two per cell (~2.5 ms per decode token at 64K context)
+    const bool    r_pow2  = (r & (r - 1)) == 0;
+    const int     r_shift = __builtin_ctzll((unsigned long long) r);
+    const auto blk_div = [r_pow2, r_shift, r](int64_t idx) -> int64_t { return r_pow2 ? idx >> r_shift : idx/r; };
+    const auto blk_mod = [r_pow2, r](int64_t idx) -> int64_t { return r_pow2 ? idx & (r - 1) : idx%r; };
+
+    // runs per ubatch and is O(n_kv) per stream: ~0.7 ms per decode token at 64K context on the flat path below
+    // (was ~3 ms: the group lists and two 64-bit divisions per cell). the scratch is reused across calls
+    thread_local std::vector<int32_t> blk_of;
+    thread_local std::vector<int32_t> cell_grp;
+    thread_local std::vector<int32_t> grp_head;
+    blk_of  .resize(n_kv);
+    cell_grp.resize(n_kv);
+    grp_head.resize(n_blocks);
+    thread_local std::vector<uint64_t> flat_slots;
+    thread_local std::vector<int32_t>  flat_first;
+    thread_local std::vector<int32_t>  flat_bid;
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
     std::vector<int32_t>  grp_slot0;
@@ -497,7 +518,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 }
 
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
-                const int64_t pb  = idx/r;
+                const int64_t pb  = blk_div(idx);
 
                 if (pb >= n_blocks) {
                     oor = true;
@@ -525,20 +546,175 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     grp_head[pb] = g;
                 }
 
-                const uint64_t bit = uint64_t(1) << (idx%r);
+                const uint64_t bit = uint64_t(1) << blk_mod(idx);
 
                 dup |= (grp_slots[g] & bit) != 0;
 
                 cell_grp[j]   = g;
                 grp_slots[g] |= bit;
 
-                if (idx%r == 0) {
+                if (blk_mod(idx) == 0) {
                     grp_slot0[g] = (int32_t) j;
                 }
             }
         };
 
-        group_cells();
+        // one sequence without repeated positions (every text chat): a cell's group is simply its block pos/r, so flat
+        // per-block arrays replace the group lists (~2 ms per decode token at 64K context); same outputs
+        // LLAMA_QSA_FLAT=0: always the general path
+        static const bool flat_env = [] { const char * e = getenv("LLAMA_QSA_FLAT"); return !e || atoi(e) != 0; }();
+        bool flat = flat_env && one_seq;
+
+        // one stream: the grouping is kept between calls (qsa_inc) and a call that only filled cells updates the blocks
+        // they touch; any other change (removed or moved cells, a repeated slot, a block completing out of order) or a
+        // window that shrank takes the full scan, which refreshes the state (LLAMA_QSA_INC=0: always the full scan)
+        static const bool inc_env = [] { const char * e = getenv("LLAMA_QSA_INC"); return !e || atoi(e) != 0; }();
+        auto &        st      = qsa_inc;
+        const bool    inc_use = flat && inc_env && n_ns == 1;
+        bool          inc     = false;
+
+        if (inc_use && st.valid && st.cells == (const void *) &cells && st.r == r && n_kv >= st.n_kv && n_blocks >= st.n_blocks) {
+            inc = [&]() {
+                const llama_pos * P = cells.pos_data();
+
+                int32_t chg[64];
+                int     n_chg = 0;
+
+                constexpr int64_t CH = 1024;
+                for (int64_t j0 = 0; j0 < st.n_kv; j0 += CH) {
+                    const int64_t n = std::min(CH, st.n_kv - j0);
+                    if (memcmp(P + j0, st.pos.data() + j0, n*sizeof(llama_pos)) == 0) {
+                        continue;
+                    }
+                    for (int64_t j = j0; j < j0 + n; ++j) {
+                        if (P[j] != st.pos[j]) {
+                            if (n_chg == 64 || st.pos[j] != -1) {
+                                return false;
+                            }
+                            chg[n_chg++] = (int32_t) j;
+                        }
+                    }
+                }
+                for (int64_t j = st.n_kv; j < n_kv; ++j) {
+                    if (P[j] != -1) {
+                        if (n_chg == 64) {
+                            return false;
+                        }
+                        chg[n_chg++] = (int32_t) j;
+                    }
+                }
+                for (int k = 0; k < n_chg; ++k) {
+                    if (P[chg[k]] < 0 || blk_div(P[chg[k]]) >= n_blocks) {
+                        return false;
+                    }
+                }
+
+                st.pos    .resize(n_kv, -1);
+                st.blk_of .resize(n_kv, -1);
+                st.slots  .resize(n_blocks, 0);
+                st.first  .resize(n_blocks, -1);
+                st.bid    .resize(n_blocks, -1);
+                st.members.resize(r*n_blocks, -1);
+                st.n_kv     = n_kv;
+                st.n_blocks = n_blocks;
+
+                // in position order, so blocks complete in order
+                std::sort(chg, chg + n_chg, [P](int32_t a, int32_t b) { return P[a] < P[b]; });
+
+                for (int k = 0; k < n_chg; ++k) {
+                    const int64_t  j   = chg[k];
+                    const int64_t  p   = P[j];
+                    const int64_t  pb  = blk_div(p);
+                    const int64_t  sl  = blk_mod(p);
+                    const uint64_t bit = uint64_t(1) << sl;
+
+                    if (st.slots[pb] & bit) {
+                        st.valid = false; // half applied: the full scan rebuilds it
+                        return false;
+                    }
+
+                    st.slots[pb]        |= bit;
+                    st.members[pb*r + sl] = (int32_t) j;
+                    st.pos[j]             = (llama_pos) p;
+
+                    if (st.first[pb] < 0 || j < st.first[pb]) {
+                        st.first[pb] = (int32_t) j;
+                    }
+
+                    if (st.slots[pb] == slots_full) {
+                        if (pb <= st.pb_last) {
+                            st.valid = false; // an earlier block completed late: the block ids after it shift
+                            return false;
+                        }
+
+                        const int32_t b = (int32_t) st.bid_idx.size();
+
+                        st.bid[pb]  = b;
+                        st.pb_last  = pb;
+
+                        st.bid_idx .push_back((int32_t) (pb*r));
+                        st.bid_cell.push_back(st.first[pb]);
+
+                        for (int64_t m = 0; m < r; ++m) {
+                            st.blk_of[st.members[pb*r + m]] = b;
+                        }
+                    }
+                }
+
+                return true;
+            }();
+        }
+
+        if (flat && !inc) {
+            flat_slots.assign(n_blocks, 0);
+            flat_first.assign(n_blocks, -1);
+
+            if (inc_use) {
+                st.members.assign(r*n_blocks, -1);
+            }
+
+            // plain pointers: the thread_local vectors would be re-resolved (TLS lookup) inside the loop
+            uint64_t * slots = flat_slots.data();
+            int32_t  * first = flat_first.data();
+            int32_t  * memb  = inc_use ? st.members.data() : nullptr;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+
+                const int64_t idx = cells.pos_get(j);
+                const int64_t pb  = blk_div(idx);
+
+                if (pb >= n_blocks) {
+                    oor = true;
+                    continue;
+                }
+
+                const uint64_t bit = uint64_t(1) << blk_mod(idx);
+
+                dup |= (slots[pb] & bit) != 0;
+
+                slots[pb] |= bit;
+
+                if (first[pb] < 0) {
+                    first[pb] = (int32_t) j;
+                }
+
+                if (memb) {
+                    memb[pb*r + blk_mod(idx)] = (int32_t) j;
+                }
+            }
+
+            // repeated positions of an image (mrope): the cells are ranked below, on the general path
+            if (dup && ubatch->is_pos_2d()) {
+                flat = false;
+            }
+        }
+
+        if (!flat) {
+            group_cells();
+        }
 
         // mrope repeats one position across an image, so rank cells instead of using the position
         if (dup && ubatch->is_pos_2d() && one_seq) {
@@ -580,17 +756,40 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         int32_t n_bid = 0;
 
-        for (int64_t pb = 0; pb < n_blocks; ++pb) {
-            for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
-                if (grp_slots[g] != slots_full) {
+        if (inc) {
+            n_bid = (int32_t) st.bid_idx.size();
+
+            bid_idx  = st.bid_idx;
+            bid_cell = st.bid_cell;
+        } else if (flat) {
+            flat_bid.resize(n_blocks);
+
+            for (int64_t pb = 0; pb < n_blocks; ++pb) {
+                flat_bid[pb] = -1;
+
+                if (flat_slots[pb] != slots_full) {
                     continue;
                 }
 
-                grp_bid[g] = n_bid++;
+                flat_bid[pb] = n_bid++;
 
                 bid_idx  .push_back((int32_t) (pb*r));
-                bid_cell .push_back(grp_first[g]);
-                bid_slot0.push_back(grp_slot0[g]);
+                bid_cell .push_back(flat_first[pb]);
+                bid_slot0.push_back(-1); // read only when ranked
+            }
+        } else {
+            for (int64_t pb = 0; pb < n_blocks; ++pb) {
+                for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
+                    if (grp_slots[g] != slots_full) {
+                        continue;
+                    }
+
+                    grp_bid[g] = n_bid++;
+
+                    bid_idx  .push_back((int32_t) (pb*r));
+                    bid_cell .push_back(grp_first[g]);
+                    bid_slot0.push_back(grp_slot0[g]);
+                }
             }
         }
 
@@ -626,30 +825,118 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            const int32_t g = cell_grp[j];
+        int32_t       * blk_of_p = inc ? st.blk_of.data() : blk_of.data();
+        const int32_t * fbid     = inc ? st.bid.data() : flat ? flat_bid.data() : nullptr;
+        const int32_t * cgrp     = cell_grp.data();
 
-            blk_of[j] = g < 0 ? -1 : grp_bid[g];
+        if (inc) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                cur_cell_blk[j] = blk_of_p[j] < 0 ? dead_bid : blk_of_p[j];
+            }
 
-            if (blk_of[j] >= 0) {
+            const int32_t * memb = st.members.data();
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                const int32_t * mb = memb + (int64_t) bid_idx[b]; // members of position block bid_idx[b]/r, r per block
+                std::copy(mb, mb + r, cur_blk_cells + (int64_t) b*r);
+
+                if (kcache) {
+                    bid_last[b] = mb[r - 1];
+                }
+            }
+        }
+
+        for (int64_t j = 0; j < (inc ? 0 : n_kv); ++j) {
+            if (flat) {
+                const int64_t pb = cells.is_empty(j) ? n_blocks : blk_div(cells.pos_get(j));
+
+                blk_of_p[j] = pb < n_blocks ? fbid[pb] : -1;
+            } else {
+                const int32_t g = cgrp[j];
+
+                blk_of_p[j] = g < 0 ? -1 : grp_bid[g];
+            }
+
+            if (blk_of_p[j] >= 0) {
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
 
-                cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
+                cur_blk_cells[blk_of_p[j]*r + blk_mod(idx)] = (int32_t) j;
 
                 if (kcache) {
                     // a block's key lives in the row of its LAST member, and only a block this
                     // ubatch writes a position into can have changed
-                    if (idx%r == r - 1) {
-                        bid_last[blk_of[j]] = (int32_t) j;
+                    if (blk_mod(idx) == r - 1) {
+                        bid_last[blk_of_p[j]] = (int32_t) j;
                     }
 
-                    if (std::binary_search(pos_set.begin(), pos_set.end(), cells.pos_get(j))) {
-                        bid_touched[blk_of[j]] = 1;
+                    // flat: the touched blocks are those of the ubatch positions, marked below in O(tokens)
+                    if (!flat && std::binary_search(pos_set.begin(), pos_set.end(), cells.pos_get(j))) {
+                        bid_touched[blk_of_p[j]] = 1;
                     }
                 }
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            cur_cell_blk[j] = blk_of_p[j] < 0 ? dead_bid : blk_of_p[j];
+        }
+
+        if (inc_use && !inc) {
+            // refresh the kept state from this full scan; a repeated slot would not survive the round trip
+            st.valid = flat && !dup && !oor;
+            if (st.valid) {
+                const llama_pos * P = cells.pos_data();
+
+                st.cells    = (const void *) &cells;
+                st.r        = r;
+                st.n_kv     = n_kv;
+                st.n_blocks = n_blocks;
+                st.pos      .assign(P, P + n_kv);
+                st.slots    .assign(flat_slots.begin(), flat_slots.begin() + n_blocks);
+                st.first    .assign(flat_first.begin(), flat_first.begin() + n_blocks);
+                st.bid      .assign(flat_bid.begin(),   flat_bid.begin()   + n_blocks);
+                st.blk_of   .assign(blk_of_p, blk_of_p + n_kv);
+                st.bid_idx  = bid_idx;
+                st.bid_cell = bid_cell;
+                st.pb_last  = n_bid > 0 ? bid_idx[n_bid - 1]/r : -1;
+            }
+        } else if (!inc_use && n_ns == 1) {
+            st.valid = false;
+        }
+
+        // LLAMA_QSA_INC_CHECK=1 (debug): compare the incrementally kept grouping with a scan from scratch
+        static const bool inc_check = [] { const char * e = getenv("LLAMA_QSA_INC_CHECK"); return e && atoi(e) != 0; }();
+        if (inc && inc_check) {
+            std::vector<uint64_t> sl(n_blocks, 0);
+            std::vector<int32_t>  fi(n_blocks, -1), bi(n_blocks, -1);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j)) {
+                    const int64_t pb = blk_div(cells.pos_get(j));
+                    sl[pb] |= uint64_t(1) << blk_mod(cells.pos_get(j));
+                    fi[pb]  = fi[pb] < 0 ? (int32_t) j : fi[pb];
+                }
+            }
+            int32_t nb = 0;
+            for (int64_t pb = 0; pb < n_blocks; ++pb) {
+                if (sl[pb] == slots_full) {
+                    GGML_ASSERT(nb < n_bid && bid_idx[nb] == pb*r && bid_cell[nb] == fi[pb] && "qsa inc: block list");
+                    bi[pb] = nb++;
+                }
+            }
+            GGML_ASSERT(nb == n_bid && "qsa inc: block count");
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const int32_t e = cells.is_empty(j) ? -1 : bi[blk_div(cells.pos_get(j))];
+                GGML_ASSERT(st.blk_of[j] == e && "qsa inc: cell block");
+            }
+        }
+
+        if (kcache && flat) {
+            // a block is touched when this ubatch writes one of its positions; on the flat path a position's block is
+            // pos/r, so the ubatch's own positions name them (same set as the per-cell search of the general path)
+            for (const llama_pos p : pos_set) {
+                const int64_t pb = p >= 0 ? blk_div(p) : n_blocks;
+                if (pb < n_blocks && fbid[pb] >= 0) {
+                    bid_touched[fbid[pb]] = 1;
+                }
+            }
         }
 
         if (kcache) {

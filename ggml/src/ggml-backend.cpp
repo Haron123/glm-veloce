@@ -826,18 +826,34 @@ struct ggml_backend_sched {
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
+
+    // GGML_SCHED_KEEPALIVE (decode): a backend of the first device split and the last split's event; the next
+    // ggml_backend_sched_synchronize makes that backend's stream wait for the event (see compute_splits)
+    ggml_backend_t       ka_backend;
+    ggml_backend_event_t ka_event;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
 
     // pinned staging for user inputs that live in host buffers: they are memcpy'd here and uploaded asynchronously,
     // instead of a synchronous upload that waits until the destination device is idle (which serializes pipeline
     // parallelism on backends whose synchronous copies drain the device, e.g. ROCm)
+    // One slot per graph, shared by the backends: an input that several splits read (the KQ mask goes to every
+    // pipeline stage) is copied once and every backend uploads from the same pinned bytes.
     struct input_staging_t {
         ggml_backend_buffer_t buf;     // (the scheduler is calloc'd: plain members only)
         size_t                used;
-        ggml_backend_buffer_t retired[4]; // outgrown buffers, still read by queued uploads; freed at the next reset
-        ggml_backend_event_t  done;       // recorded on the backend after the graph that used this staging slot
-    } input_staging[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+        ggml_backend_event_t  done[GGML_SCHED_MAX_BACKENDS]; // recorded on each backend after the graph's uploads
+        bool                  pending[GGML_SCHED_MAX_BACKENDS]; // backend b uploaded from this slot
+        const ggml_tensor *   keys[64]; // inputs staged in this slot by the current graph
+        const uint8_t *       ptrs[64];
+        size_t                sizes[64];
+        int                   n_keys;
+    } input_staging[GGML_SCHED_MAX_COPIES];
+    // outgrown staging buffers that queued uploads may still read. Freed only where the scheduler synchronizes anyway:
+    // the pinned free (hipHostFree) waits for every device, so freeing them during compute serialized the pipeline
+    // (the slots outgrow their 32 MiB start past ~18K context: pp at 20K 1065 -> 580 t/s on the pass that grows them)
+    ggml_backend_buffer_t staging_deferred[32];
+    int n_staging_deferred;
     // staging slot of the current graph: a ring advanced every graph, independent of cur_copy (which stays fixed while
     // llama reuses a graph, so keying the staging by it made every graph wait for the previous one on the host)
     int stage_slot;
@@ -1737,52 +1753,86 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #endif
 static_assert(GGML_SCHED_STAGE_RING <= GGML_SCHED_MAX_COPIES, "staging ring larger than the staging array");
 
+// frees the outgrown staging buffers; sync: wait for every backend first (they may still be read by queued uploads)
+static void ggml_backend_sched_free_deferred_staging(ggml_backend_sched_t sched, bool sync) {
+    if (sched->n_staging_deferred == 0) {
+        return;
+    }
+    if (sync) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_synchronize(sched->backends[b]);
+        }
+    }
+    for (int i = 0; i < sched->n_staging_deferred; i++) {
+        ggml_backend_buffer_free(sched->staging_deferred[i]);
+        sched->staging_deferred[i] = nullptr;
+    }
+    sched->n_staging_deferred = 0;
+}
+
 static bool ggml_backend_sched_stage_host_input(ggml_backend_sched_t sched, ggml_backend_t split_backend, int split_backend_id,
                                                 const ggml_tensor * input, ggml_tensor * input_cpy) {
     static const bool no_staging = [] { const char * e = getenv("GGML_SCHED_NO_INPUT_STAGING"); return e && atoi(e) != 0; }();
     ggml_backend_dev_t split_dev = ggml_backend_get_device(split_backend);
     ggml_backend_buffer_type_t host_buft = split_dev ? ggml_backend_dev_host_buffer_type(split_dev) : nullptr;
-    if (no_staging || sched->n_copies <= 1 || !host_buft || !split_backend->iface.set_tensor_async ||
+    // also without pipeline copies (e.g. -sm tensor: one meta backend): the uploads are ordered on the backend's stream after
+    // its earlier reads and the staging ring tracks its own completion; unstaged, every input is a blocking pageable copy
+    // (tensor-parallel decode: ~10 inputs, ~0.3 ms of idle GPUs per step). GGML_SCHED_STAGE_SINGLE=0: old behavior
+    static const bool stage_single = [] { const char * e = getenv("GGML_SCHED_STAGE_SINGLE"); return !e || atoi(e) != 0; }();
+    if (no_staging || (sched->n_copies <= 1 && !stage_single) || !host_buft || !split_backend->iface.set_tensor_async ||
             !input->buffer || !ggml_backend_buffer_is_host(input->buffer) || !ggml_is_contiguous(input) ||
             !input_cpy->buffer || ggml_backend_buffer_is_host(input_cpy->buffer)) {
         return false;
     }
-    auto & st = sched->input_staging[split_backend_id][sched->stage_slot];
-    const size_t n    = ggml_nbytes(input);
-    const size_t need = GGML_PAD(n, 256);
-    if (!st.buf || st.used + need > ggml_backend_buffer_get_size(st.buf)) {
-        // pinned allocations are slow: size every slot of this backend like its largest one so far (one growth series)
-        size_t biggest = 32u << 20;
-        for (int q = 0; q < GGML_SCHED_STAGE_RING; q++) {
-            const auto & o = sched->input_staging[split_backend_id][q];
-            if (o.buf) {
-                biggest = std::max(biggest, ggml_backend_buffer_get_size(o.buf));
-            }
+    auto & st = sched->input_staging[sched->stage_slot];
+    const size_t n = ggml_nbytes(input);
+    const uint8_t * p = nullptr;
+    for (int k = 0; k < st.n_keys; k++) {
+        if (st.keys[k] == input && st.sizes[k] == n) {
+            p = st.ptrs[k];
+            break;
         }
-        const size_t new_size = std::max<size_t>(2*(st.used + need), biggest);
-        if (st.buf) {
-            // queued uploads of this graph may still read the old buffer: retire it until this slot is reset
-            int r = 0;
-            while (r < 4 && st.retired[r]) {
-                r++;
-            }
-            if (r == 4) {
-                ggml_backend_synchronize(split_backend);
-                for (int q = 0; q < 4; q++) {
-                    ggml_backend_buffer_free(st.retired[q]);
-                    st.retired[q] = nullptr;
-                }
-                r = 0;
-            }
-            st.retired[r] = st.buf;
-        }
-        st.buf  = ggml_backend_buft_alloc_buffer(host_buft, new_size);
-        st.used = 0;
     }
-    uint8_t * p = (uint8_t *) ggml_backend_buffer_get_base(st.buf) + st.used;
-    memcpy(p, input->data, n);
+    if (p == nullptr) {
+        const size_t need = GGML_PAD(n, 256);
+        if (!st.buf || st.used + need > ggml_backend_buffer_get_size(st.buf)) {
+            // pinned allocations are slow: size every slot like the largest one so far (one growth series)
+            size_t biggest = 32u << 20;
+            for (int q = 0; q < GGML_SCHED_STAGE_RING; q++) {
+                const auto & o = sched->input_staging[q];
+                if (o.buf) {
+                    biggest = std::max(biggest, ggml_backend_buffer_get_size(o.buf));
+                }
+            }
+            const size_t new_size = std::max<size_t>(2*(st.used + need), biggest);
+            if (st.buf) {
+                // queued uploads of this graph may still read the old buffer
+                if (sched->n_staging_deferred == (int) (sizeof(sched->staging_deferred)/sizeof(sched->staging_deferred[0]))) {
+                    ggml_backend_sched_free_deferred_staging(sched, true);
+                }
+                sched->staging_deferred[sched->n_staging_deferred++] = st.buf;
+                st.n_keys = 0; // the recorded pointers stay valid (deferred), but new entries go to the new buffer
+            }
+            st.buf  = ggml_backend_buft_alloc_buffer(host_buft, new_size);
+            st.used = 0;
+        }
+        uint8_t * q = (uint8_t *) ggml_backend_buffer_get_base(st.buf) + st.used;
+        memcpy(q, input->data, n);
+        st.used += need;
+        p = q;
+        if (st.n_keys < 64) {
+            st.keys[st.n_keys]  = input;
+            st.ptrs[st.n_keys]  = p;
+            st.sizes[st.n_keys] = n;
+            st.n_keys++;
+        }
+    }
+    if (split_backend->iface.stage_host_input && split_backend->iface.stage_host_input(split_backend, input_cpy, p, n)) {
+        st.pending[split_backend_id] = true;
+        return true;
+    }
     split_backend->iface.set_tensor_async(split_backend, input_cpy, p, 0, n);
-    st.used += need;
+    st.pending[split_backend_id] = true;
     return true;
 }
 
@@ -1811,25 +1861,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // next staging slot; it was last used GGML_SCHED_MAX_COPIES graphs ago and is free once that graph's work on the
     // backend is done (its own event), so the host only waits if it runs that many graphs ahead
     sched->stage_slot = (sched->stage_slot + 1) % GGML_SCHED_STAGE_RING;
-    for (int b = 0; b < sched->n_backends; b++) {
-        auto & st = sched->input_staging[b][sched->stage_slot];
-        if (st.used > 0) {
-            if (st.done != NULL) {
-                ggml_backend_event_synchronize(st.done);
-            } else {
-                ggml_backend_synchronize(sched->backends[b]);
-            }
-            st.used = 0;
-            for (int q = 0; q < 4; q++) {
-                if (st.retired[q]) {
-                    ggml_backend_buffer_free(st.retired[q]);
-                    st.retired[q] = nullptr;
+    {
+        auto & st = sched->input_staging[sched->stage_slot];
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (st.pending[b]) {
+                if (st.done[b] != NULL) {
+                    ggml_backend_event_synchronize(st.done[b]);
+                } else {
+                    ggml_backend_synchronize(sched->backends[b]);
                 }
+                st.pending[b] = false;
             }
         }
+        st.used   = 0;
+        st.n_keys = 0;
     }
 
-    if (ht) { g_sched_ht.t[0] += ggml_sched_host_timing::now() - ht0; }
+    if (ht) {
+        g_sched_ht.t[0] += ggml_sched_host_timing::now() - ht0;
+        if (g_sched_ht.t[0] > 5000) {
+            fprintf(stderr, "sched: staging ring wait %.2f ms (slot %d)\n", g_sched_ht.t[0]/1e3, sched->stage_slot);
+        }
+    }
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1838,7 +1891,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (ht) { ht0 = ggml_sched_host_timing::now(); }
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // the wait guards memory the allocator shares between backends of one buffer type (virtual devices of one GPU);
+        // backends with different buffer types own disjoint buffers, and a split without inputs reads nothing of the
+        // previous one, so it may run alongside it (layer split: the two halves of the vocabulary head, LLAMA_HEAD_SPLIT).
+        // GGML_SCHED_DISJOINT_NOSYNC=0: always wait
+        static const bool disjoint_nosync = [] { const char * e = getenv("GGML_SCHED_DISJOINT_NOSYNC"); return !e || atoi(e) != 0; }();
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+                !(disjoint_nosync && sched->bufts[prev_backend_id] != sched->bufts[split_backend_id])) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -2044,6 +2103,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 fprintf(stderr, "sched: split %d (%s) host: inputs+waits %.2f ms, launch %.2f ms, done at mono %.1f ms\n", split_id,
                     ggml_backend_name(split_backend), (tc0 - ht0)/1e3, (ggml_sched_host_timing::now() - tc0)/1e3,
                     ts.tv_sec*1e3 + ts.tv_nsec/1e6);
+                if (getenv("GGML_SCHED_HT_NODES") && split->graph.n_nodes < 64) {
+                    for (int i = 0; i < split->graph.n_nodes; i++) {
+                        const ggml_tensor * nd = split->graph.nodes[i];
+                        fprintf(stderr, "sched:     node %s op %s src0 %s\n", nd->name, ggml_op_desc(nd), nd->src[0] ? nd->src[0]->name : "-");
+                    }
+                }
             }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2090,18 +2155,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
-    // mark the staging slots used by this graph: free again once each backend finished the graph
-    for (int b = 0; b < sched->n_backends; b++) {
-        auto & st = sched->input_staging[b][sched->stage_slot];
-        if (st.used == 0) {
-            continue;
+    // GGML_SCHED_KEEPALIVE bit 1: with layer split, the first GPU idles with an EMPTY queue while the last stages and the
+    // host run; after ~2.2 ms empty its clocks drop and the next token starts slow. Give a backend of the first split
+    // a wait for the last split's event, so its queue holds a pending packet until the graph is done. The wait is
+    // enqueued when the host synchronizes (no more ubatches follow), so pipelined prefill is not serialized.
+    {
+        static const int ka = [] { const char * e = getenv("GGML_SCHED_KEEPALIVE"); return e ? atoi(e) : 3; }();
+        sched->ka_backend = nullptr;
+        sched->ka_event   = nullptr;
+        ggml_backend_event_t ev = prev_backend_id >= 0 ? sched->events[prev_backend_id][sched->cur_copy] : nullptr;
+        for (int i = 0; (ka & 1) && ev != nullptr && i < sched->n_splits; i++) {
+            const int b = splits[i].backend_id;
+            if (b != prev_backend_id && sched->events[b][sched->cur_copy] != NULL) {
+                sched->ka_backend = sched->backends[b];
+                sched->ka_event   = ev;
+                break;
+            }
         }
-        if (st.done == NULL) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
-            st.done = dev ? ggml_backend_event_new(dev) : NULL;
-        }
-        if (st.done != NULL) {
-            ggml_backend_event_record(st.done, sched->backends[b]);
+    }
+
+    // mark the staging slot used by this graph: free again once each backend that uploaded from it finished the graph
+    {
+        auto & st = sched->input_staging[sched->stage_slot];
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (!st.pending[b]) {
+                continue;
+            }
+            if (st.done[b] == NULL) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                st.done[b] = dev ? ggml_backend_event_new(dev) : NULL;
+            }
+            if (st.done[b] != NULL) {
+                ggml_backend_event_record(st.done[b], sched->backends[b]);
+            }
         }
     }
 
@@ -2189,19 +2275,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched) {
-        for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
-            for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
-                auto & st = sched->input_staging[b][c];
-                if (st.buf) {
-                    ggml_backend_buffer_free(st.buf);
-                }
-                if (st.done) {
-                    ggml_backend_event_free(st.done);
-                }
-                for (int q = 0; q < 4; q++) {
-                    if (st.retired[q]) {
-                        ggml_backend_buffer_free(st.retired[q]);
-                    }
+        ggml_backend_sched_free_deferred_staging(sched, false);
+        for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
+            auto & st = sched->input_staging[c];
+            if (st.buf) {
+                ggml_backend_buffer_free(st.buf);
+            }
+            for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+                if (st.done[b]) {
+                    ggml_backend_event_free(st.done[b]);
                 }
             }
         }
@@ -2361,9 +2443,34 @@ bool ggml_backend_sched_inputs_staged(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (sched->ka_backend != nullptr) {
+        ggml_backend_event_wait(sched->ka_backend, sched->ka_event);
+        sched->ka_backend = nullptr;
+    }
+    {
+        // GGML_SCHED_KEEPALIVE bit 2: backend clock keep-alive through the idle gap after this sync (CUDA/HIP proc
+        // "ggml_backend_keepalive": one sleeping wave per GPU until the next graph reaches it)
+        static const int ka = [] { const char * e = getenv("GGML_SCHED_KEEPALIVE"); return e ? atoi(e) : 3; }();
+        typedef void (*keepalive_t)(ggml_backend_t *, int);
+        static keepalive_t fn = nullptr;
+        static bool looked = false;
+        if ((ka & 2) && !looked) {
+            looked = true;
+            for (int b = 0; b < sched->n_backends && fn == nullptr; b++) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                fn = reg ? (keepalive_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_keepalive") : nullptr;
+            }
+        }
+        if ((ka & 2) && fn != nullptr) {
+            fn(sched->backends, sched->n_backends);
+        }
+    }
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+    // every backend is idle: the outgrown staging buffers can go without stalling anything
+    ggml_backend_sched_free_deferred_staging(sched, false);
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
