@@ -10,6 +10,20 @@ static bool qwen4exp_head_split_use() {
     static const bool use = [] { const char * e = getenv("LLAMA_HEAD_SPLIT_USE"); return !e || atoi(e) != 0; }();
     return use;
 }
+
+// the first-device part of the split LM head for n outputs: all rows of output.lo for 2..4 outputs (the MTP verify, where
+// the last device, hot from its stages, is the slower half), the first LLAMA_HEAD_SPLIT_1TOK (0.5) of the vocabulary for
+// one output (decode, draft steps); a view of output.lo bound to its buffer, so the matmul stays on the first device
+static ggml_tensor * qwen4exp_head_lo(ggml_context * ctx0, ggml_tensor * output_lo, int64_t n_vocab, int n_outputs) {
+    static const double f1 = [] { const char * e = getenv("LLAMA_HEAD_SPLIT_1TOK"); return e ? atof(e) : 0.5; }();
+    const int64_t m1 = ((int64_t) (f1*(double) n_vocab) / 256)*256;
+    if (n_outputs != 1 || m1 <= 0 || m1 >= output_lo->ne[1]) {
+        return output_lo;
+    }
+    ggml_tensor * v = ggml_view_2d(ctx0, output_lo, output_lo->ne[0], m1, output_lo->nb[1], 0);
+    ggml_backend_view_init(v);
+    return v;
+}
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
@@ -555,8 +569,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     if (model.output_lo != nullptr && qwen4exp_head_split_use() && model.output_s == nullptr && samplers.empty() && n_outputs >= 1 && n_outputs <= 4) {
         // the first device's rows first in graph order: its split starts (async) before the last device's, which needs
         // nothing from it, so the two halves run at the same time; the host gathers both into one logits row
-        const int64_t m0 = model.output_lo->ne[1];
-        ggml_tensor * lo = build_lora_mm(model.output_lo, cur, nullptr);
+        ggml_tensor * w_lo = qwen4exp_head_lo(ctx0, model.output_lo, model.output->ne[1], (int) n_outputs);
+        const int64_t m0 = w_lo->ne[1];
+        ggml_tensor * lo = build_lora_mm(w_lo, cur, nullptr);
         cb(lo, "result_output_lo", -1);
         ggml_build_forward_expand(gf, lo);
         ggml_tensor * w_hi = ggml_view_2d(ctx0, model.output, model.output->ne[0], model.output->ne[1] - m0, model.output->nb[1],
@@ -776,8 +791,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         // LLAMA_HEAD_SPLIT: the draft head on both GPUs, as the trunk's (see there). The draft samples on the device, so
         // the halves are joined on the last device; the x1 scale is a split boundary on the first device between the two
         // matmuls and the join (without it the join's copy of the first half would make the second matmul wait)
-        const int64_t m0 = head_owner->output_lo->ne[1];
-        ggml_tensor * lo = build_lora_mm(head_owner->output_lo, cur, nullptr);
+        ggml_tensor * w_lo = qwen4exp_head_lo(ctx0, head_owner->output_lo, head_w->ne[1], (int) n_outputs);
+        const int64_t m0 = w_lo->ne[1];
+        ggml_tensor * lo = build_lora_mm(w_lo, cur, nullptr);
         ggml_build_forward_expand(gf, lo);
         ggml_tensor * w_hi = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_w->ne[1] - m0, head_w->nb[1], m0*head_w->nb[1]);
         ggml_backend_view_init(w_hi);
