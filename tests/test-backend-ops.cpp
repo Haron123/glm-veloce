@@ -10478,6 +10478,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the same model's expert gate/up in iq2_s / iq3_s layers: 640 x 2560, one activation row per token (b = true)
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
+    // and its decode / MTP verify FFN (GCN: the flat gate/up pair kernel + the per-slot down), each gate/up type once,
+    // plain SwiGLU; 16 experts keep the CPU reference quick (the kernels do not depend on the expert count)
+    for (int64_t nt : {1, 2, 3}) {
+        for (auto p : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0}, {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL},
+                {GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_0}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_NL}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0}}) {
+            test_cases.emplace_back(new test_moe_glu_pair(p[0], p[1], 2560, 640, 2560, nt, 16, 10, INFINITY));
+        }
+    }
     // DeepSeek V4 Flash IQ2XXS at TP4 decode (GCN: moe_coal_iq iq2_xxs gate/up, 256 experts, top 6), plain and the fused
     // gate/up pair with the q2_K down
     for (int64_t nt : {1, 2, 3, 4, 6}) {
