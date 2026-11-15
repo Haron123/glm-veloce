@@ -54,6 +54,29 @@ static __device__ __forceinline__ float shexp_row_dot(const char * __restrict__ 
     return warp_reduce_sum<WARP_SIZE>(sum);
 }
 
+// shexp_row_dot with the row's block count NB known at compile time: the loop is unrolled, so every iteration's loads
+// can be issued before the first dot; the same lane mapping and the same accumulation order, so the same sum
+template <ggml_type type, int NB>
+static __device__ __forceinline__ float shexp_row_dot_u(const char * __restrict__ row, const block_q8_1 * __restrict__ y,
+                                                        const int lane) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = shexp_vdr<type>();
+    constexpr int bpi = vdr*WARP_SIZE/qi;
+    constexpr int nit = (NB + bpi - 1)/bpi;
+    const int kbx0 = lane/(qi/vdr);
+    const int iqs  = vdr*(lane % (qi/vdr));
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < nit; ++j) {
+        const int kbx = kbx0 + j*bpi;
+        if (kbx < NB) {
+            sum += shexp_vec_dot<type>(row, &y[kbx*(qk/QK8_1)], kbx, iqs);
+        }
+    }
+    return warp_reduce_sum<WARP_SIZE>(sum);
+}
+
 // the same for nt (2..4) tokens whose q8_1 rows are sy blocks apart: a row's weight loads and decode are shared by the
 // tokens (the guarded per-token dots reuse token 0's loads); the sums go to v[0 .. nt-1], in every lane
 template <ggml_type type>
@@ -87,7 +110,10 @@ static __device__ __forceinline__ void shexp_row_dot_n(const char * __restrict__
 // blocks 0 .. 2R/4 - 1: 4 rows each (gate rows first, then up rows); the last block: the shared gate's dot
 // NT tokens (1, or 2..4 at an MTP verify): token t's gate / up values at gu + t*2R, its shared gate dot at gdot[t]; the
 // rows are decoded once for all tokens (MULTI, nt > 1)
-template <ggml_type tg, ggml_type tu, bool MULTI>
+// KU > 0: K = 256*KU known at compile time (Qwen3.8 Flash-Next: 10), so the shared gate dot and the row dots run
+// unrolled with their loads issued up front (the shared gate block's 10 dependent load rounds were the kernel's
+// critical path); the same arithmetic in the same order
+template <ggml_type tg, ggml_type tu, bool MULTI, int KU = 0>
 __launch_bounds__(256)
 static __global__ void shexp_gu_dec(
         const char * __restrict__ Wg, const char * __restrict__ Wu, const int64_t sg, const int64_t su, const int R, const int K,
@@ -100,9 +126,23 @@ static __global__ void shexp_gu_dec(
 #pragma unroll 1
         for (int t = 0; t < NT; ++t) {
             float acc = 0.0f;
-            for (int k = threadIdx.x; k < K; k += blockDim.x) {
-                const float w = w1_bf16 ? __uint_as_float((uint32_t) ((const uint16_t *) w1)[k] << 16) : ((const float *) w1)[k];
-                acc += w*x[t*sx + k];
+            if constexpr (KU > 0) {
+                float wv[KU], xv[KU];
+#pragma unroll
+                for (int j = 0; j < KU; ++j) {
+                    const int k = threadIdx.x + 256*j;
+                    wv[j] = w1_bf16 ? __uint_as_float((uint32_t) ((const uint16_t *) w1)[k] << 16) : ((const float *) w1)[k];
+                    xv[j] = x[t*sx + k];
+                }
+#pragma unroll
+                for (int j = 0; j < KU; ++j) {
+                    acc += wv[j]*xv[j];
+                }
+            } else {
+                for (int k = threadIdx.x; k < K; k += blockDim.x) {
+                    const float w = w1_bf16 ? __uint_as_float((uint32_t) ((const uint16_t *) w1)[k] << 16) : ((const float *) w1)[k];
+                    acc += w*x[t*sx + k];
+                }
             }
             acc = warp_reduce_sum<WARP_SIZE>(acc);
             if (lane == 0) {
@@ -143,7 +183,13 @@ static __global__ void shexp_gu_dec(
         }
     } else {
         float v;
-        if (r < R) {
+        if constexpr (KU > 0) {
+            if (r < R) {
+                v = shexp_row_dot_u<tg, 256*KU/ggml_cuda_type_traits<tg>::qk>(Wg + r*sg, y, lane);
+            } else {
+                v = shexp_row_dot_u<tu, 256*KU/ggml_cuda_type_traits<tu>::qk>(Wu + (r - R)*su, y, lane);
+            }
+        } else if (r < R) {
             v = shexp_row_dot<tg>(Wg + r*sg, y, K/ggml_cuda_type_traits<tg>::qk, lane);
         } else {
             v = shexp_row_dot<tu>(Wu + (r - R)*su, y, K/ggml_cuda_type_traits<tu>::qk, lane);
@@ -293,8 +339,11 @@ void ggml_cuda_shexp_dec(ggml_backend_cuda_context & ctx, const ggml_tensor * co
     float * gdot = gu.get() + 2*R*nt;
 
     const int nb1 = (2*R + 3)/4 + 1;
-#define SHEXP_GU(TG, TU) if (nt > 1) SHEXP_GU1(TG, TU, true); else SHEXP_GU1(TG, TU, false)
-#define SHEXP_GU1(TG, TU, MU) shexp_gu_dec<TG, TU, MU><<<nb1, 256, 0, stream>>>((const char *) wg->data, (const char *) wu->data, wg->nb[1], \
+    // GGML_CUDA_SHEXP_KU=0: the generic loops also at K 2560
+    static const bool ku_env = [] { const char * e = getenv("GGML_CUDA_SHEXP_KU"); return !e || atoi(e) != 0; }();
+    const bool ku10 = ku_env && K == 2560;
+#define SHEXP_GU(TG, TU) if (nt > 1) SHEXP_GU1(TG, TU, true, 0); else if (ku10) SHEXP_GU1(TG, TU, false, 10); else SHEXP_GU1(TG, TU, false, 0)
+#define SHEXP_GU1(TG, TU, MU, KU) shexp_gu_dec<TG, TU, MU, KU><<<nb1, 256, 0, stream>>>((const char *) wg->data, (const char *) wu->data, wg->nb[1], \
         wu->nb[1], R, K, yq, sy, (const char *) w1->data, w1->type == GGML_TYPE_BF16, (const float *) x->data, sx, gu.get(), gdot, nt)
 #define SHEXP_GU_U(TG) switch (wu->type) { \
         case GGML_TYPE_Q4_K:   SHEXP_GU(TG, GGML_TYPE_Q4_K);   break; \
