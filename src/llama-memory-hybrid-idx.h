@@ -114,6 +114,14 @@ private:
     // once. conservative on purpose: a needless rebuild costs one pass, a missed one serves a stale key
     void kpool_invalidate();
 
+    // seq_rm of a tail [p0, end) with at most one sequence present keeps the pooled keys: it only removes members of
+    // blocks that end at or after p0, those blocks leave the complete set, and the ubatch that completes one again
+    // writes one of its positions, so it re-pools it (bit-identical). MTP rolls back every step: at 29K context
+    // the full rebuild cost ~1.3 ms per step. LLAMA_QSA_KPOOL_TAIL=0: re-pool after every seq_rm
+    bool kpool_tail_keeps(llama_seq_id seq_id, llama_pos p1) const;
+
+    uint32_t n_seq_max_idx = 1;
+
     // the flat (one sequence) grouping of set_input_qsa, kept between calls: a decode step only fills cells, so the next
     // call updates the few blocks they touch instead of rescanning every cell (single stream only)
     struct qsa_inc_state {

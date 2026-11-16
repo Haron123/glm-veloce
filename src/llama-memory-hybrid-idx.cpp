@@ -95,7 +95,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_idx, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    n_seq_max_idx = n_seq_max;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -176,6 +178,22 @@ void llama_memory_hybrid_idx::kpool_invalidate() {
     }
 }
 
+bool llama_memory_hybrid_idx::kpool_tail_keeps(llama_seq_id seq_id, llama_pos p1) const {
+    static const bool on = [] { const char * e = getenv("LLAMA_QSA_KPOOL_TAIL"); return !e || atoi(e) != 0; }();
+    if (!on || !mem_idx || p1 >= 0) {
+        return false;
+    }
+    // another sequence sharing cells could regroup them (a block completing without a write): re-pool then
+    int n_seq = 0;
+    for (uint32_t s = 0; s < n_seq_max_idx; ++s) {
+        if (mem_idx->seq_pos_min((llama_seq_id) s) >= 0 && ++n_seq > 1) {
+            return false;
+        }
+    }
+    GGML_UNUSED(seq_id);
+    return true;
+}
+
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
 
@@ -192,11 +210,16 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         return false;
     }
 
+    // decided before the removal: it counts the sequences present
+    const bool keep = kpool_tail_keeps(seq_id, p1);
+
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
-    kpool_invalidate();
+    if (!keep) {
+        kpool_invalidate();
+    }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
