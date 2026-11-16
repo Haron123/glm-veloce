@@ -2340,13 +2340,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = (nextn_ring_active() && !masked ? nextn_ring_region(nextn_ring_cur) : embd_nextn.data) + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                if (masked && n_rows < (int64_t) ubatch.n_tokens && t_h_nextn->ne[1] == (int64_t) ubatch.n_tokens) {
+                // rows of n_embd values: the tensor may be 3D (qwen4exp: [n_embd, hc streams, rows]), so ne[1] is not
+                // the row count (a 4-row MTP merge matched hc = 4 and read past the end)
+                const int64_t h_rows = ggml_nelements(t_h_nextn)/n_embd;
+                if (masked && n_rows < (int64_t) ubatch.n_tokens && h_rows == (int64_t) ubatch.n_tokens &&
+                        ggml_is_contiguous(t_h_nextn)) {
                     // the graph kept every token's row (no output selection, e.g. an MTP draft decode that carries the
                     // catch-up rows ahead of its output row): copy the output rows, in order
                     int64_t r = 0;
                     for (uint32_t k = 0; k < ubatch.n_tokens && r < n_rows; ++k) {
                         if (ubatch.output[k]) {
-                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + r*n_embd, k*t_h_nextn->nb[1],
+                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + r*n_embd, k*n_embd*sizeof(float),
                                     n_embd*sizeof(float));
                             ++r;
                         }

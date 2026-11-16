@@ -1742,8 +1742,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // not with a bounded-rollback drafter memory (its snapshots assume the catch-up decode), and only for one draft
             // token per step: with more, the merged decode takes 2..n_max + 2 rows (the two graph slots thrash: Qwen3.8-27B
             // DRAFTS=2 -1.5%) and a 4-row GLM-5.3 drafter decode with an output row hit a CPY size assert
-            merge_catchup = (!e || atoi(e) != 0) && !is_mem_shared && !chain_heads && llama_n_rs_seq(ctx_dft) == 0 &&
-                this->params.n_max == 1;
+            // LLAMA_SPEC_MTP_MERGE=2: merge also with more draft tokens (opt-in; Qwen3.8 Flash-Next layer split, 2 drafts,
+            // 29K context: the draft phase got slower, 3.38 -> 3.71 ms per step, no net gain)
+            const int merge_env = e ? atoi(e) : 1;
+            merge_catchup = merge_env != 0 && !is_mem_shared && !chain_heads && llama_n_rs_seq(ctx_dft) == 0 &&
+                (this->params.n_max == 1 || merge_env >= 2);
         }
         cu_pend.assign(n_seq, {});
     }
