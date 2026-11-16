@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <algorithm>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -635,6 +636,13 @@ server_tokens server_tokens::deserialize(const llama_tokens & packed, bool has_m
 }
 
 llama_tokens server_tokens::get_text_tokens() const {
+    if (map_idx_to_media.empty()) {
+        // no media: one block copy, then drop placeholders if any (normally none, so a plain scan); same list as the
+        // loop below. called for every MTP draft: the push_back loop took ~90 us per step at 29K tokens
+        llama_tokens res(tokens);
+        res.erase(std::remove(res.begin(), res.end(), LLAMA_TOKEN_NULL), res.end());
+        return res;
+    }
     llama_tokens res;
     res.reserve(tokens.size());
     for (llama_token t : tokens) {

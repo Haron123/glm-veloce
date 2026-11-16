@@ -399,13 +399,25 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    // LLAMA_KV_RM_FAST=0: always scan every cell. otherwise a call that removes nothing returns at once and the scan covers
+    // only the used cells (the others are empty, pos_in is false for them): MTP rolls back after every verify and the full
+    // scan runs over the whole -c cells for each cache (~0.24 ms per step at -c 72000)
+    static const bool rm_fast = [] { const char * e = getenv("LLAMA_KV_RM_FAST"); return !e || atoi(e) != 0; }();
+
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        if (rm_fast && (cells.seq_pos_max(seq_id) < p0 || cells.seq_pos_min(seq_id) >= p1)) {
+            return true;
+        }
+
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        const uint32_t i_beg = rm_fast ? cells.used_min()    : 0;
+        const uint32_t i_end = rm_fast ? cells.used_max_p1() : cells.size();
+
+        for (uint32_t i = i_beg; i < i_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -429,7 +441,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            const uint32_t i_beg = rm_fast ? cells.used_min()    : 0;
+            const uint32_t i_end = rm_fast ? cells.used_max_p1() : cells.size();
+
+            for (uint32_t i = i_beg; i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
@@ -1799,6 +1814,45 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // only the SWA cache (or the SWA layers of a single cache) become non-causal
     if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    // one sequence in the cache and in the ubatch, causal, no SWA, no alibi, one stream: the general loop keeps a cell iff
+    // it is not empty and its position < the token's, or == with (M-RoPE) a 2D position not after the token's; compute
+    // exactly that from the position array (empty = -1, which the unsigned compare drops). ~70 us -> a few us per decode
+    // at 29K cells. LLAMA_KV_MASK_FAST=0: off
+    static const bool mask_fast = [] { const char * e = getenv("LLAMA_KV_MASK_FAST"); return !e || atoi(e) != 0; }();
+    if (mask_fast && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_stream == 1 && n_tokens > 0) {
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        bool one = seq_id >= 0 && (size_t) seq_id < seq_to_stream.size();
+        for (uint32_t i = 0; one && i < n_tokens; ++i) {
+            one = ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == seq_id;
+        }
+        const llama_kv_cells * cp = one ? &v_cells[seq_to_stream[seq_id]] : nullptr;
+        for (uint32_t s = 0; one && s < seq_to_stream.size(); ++s) {
+            one = (llama_seq_id) s == seq_id || cp->seq_pos_min((llama_seq_id) s) < 0;
+        }
+        if (one && n_kv <= (int64_t) cp->size()) {
+            const llama_pos * P     = cp->pos_data();
+            const bool        is_2d = ubatch->is_pos_2d();
+            auto fill = [&](auto * data, auto keep, auto drop) {
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const uint32_t  p1   = (uint32_t) ubatch->pos[i];
+                    const llama_pos p1_x = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
+                    const llama_pos p1_y = is_2d ? ubatch->pos[i + n_tokens]   : 0;
+                    auto *          row  = data + n_kv*i;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const uint32_t p0 = (uint32_t) P[j];
+                        row[j] = p0 < p1 ? keep : p0 > p1 ? drop : (is_2d && cp->ext_get(j).is_2d_gt(p1_x, p1_y)) ? drop : keep;
+                    }
+                }
+            };
+            if (dst->type == GGML_TYPE_F16) {
+                fill((ggml_fp16_t *) dst->data, llama_cast<ggml_fp16_t>(0.0f), llama_cast<ggml_fp16_t>(-INFINITY));
+            } else {
+                fill((float *) dst->data, 0.0f, -INFINITY);
+            }
+            return;
+        }
     }
 
     //const int64_t t_start = ggml_time_us();
