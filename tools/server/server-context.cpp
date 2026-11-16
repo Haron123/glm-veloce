@@ -3236,6 +3236,10 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        if (spec && slot.can_speculate()) {
+                            common_speculative_set_prompt_end(spec.get(), slot.id, (llama_pos) slot.task->n_tokens());
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 

@@ -165,6 +165,9 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    // see common_speculative_set_prompt_end
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*n_prompt*/) {}
+
     virtual bool process(const llama_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
@@ -1643,6 +1646,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     };
     std::vector<catchup_rows> cu_pend; // [n_seq]
 
+    // LLAMA_MTP_PROMPT_SKIP (default 1) with the drafter's attention window (LLAMA_MTP_SWA, default 16384): a prompt
+    // batch that ends before prompt_end - window - 64 is never attended by a later draft (a row's K/V depend on its own
+    // input only, and the prompt rows' outputs are unused), so its catch-up decode is skipped; the drafts are unchanged
+    std::vector<llama_pos> prompt_end; // [n_seq], 0 = unknown
+
+    void set_prompt_end(llama_seq_id seq_id, llama_pos n_prompt) override {
+        if (seq_id >= 0 && (size_t) seq_id < prompt_end.size()) {
+            prompt_end[seq_id] = n_prompt;
+        }
+    }
+
+    bool prompt_batch_skippable(const llama_batch & b) const {
+        static const bool on  = [] { const char * e = getenv("LLAMA_MTP_PROMPT_SKIP"); return !e || atoi(e) != 0; }();
+        static const int  win = [] { const char * e = getenv("LLAMA_MTP_SWA"); return e ? atoi(e) : 16384; }();
+        if (!on || win <= 0 || b.n_tokens <= 0) {
+            return false;
+        }
+        for (int k = 0; k < b.n_tokens; ++k) {
+            const llama_seq_id s = b.seq_id[k][0];
+            if (s < 0 || (size_t) s >= prompt_end.size() || prompt_end[s] <= 0 || b.pos[k] >= prompt_end[s] - win - 64) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1749,6 +1778,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 (this->params.n_max == 1 || merge_env >= 2);
         }
         cu_pend.assign(n_seq, {});
+        prompt_end.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1986,7 +2016,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !(!store && prompt_batch_skippable(batch_in))) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -3406,6 +3436,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos n_prompt) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, n_prompt);
     }
 }
 

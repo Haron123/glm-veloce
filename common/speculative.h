@@ -82,6 +82,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// the prompt of seq_id ends at position n_prompt (exclusive): a drafter with an attention window may skip prompt batches
+// that no later draft can attend (MTP with LLAMA_MTP_SWA)
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos n_prompt);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
