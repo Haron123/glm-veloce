@@ -1821,7 +1821,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // exactly that from the position array (empty = -1, which the unsigned compare drops). ~70 us -> a few us per decode
     // at 29K cells. LLAMA_KV_MASK_FAST=0: off
     static const bool mask_fast = [] { const char * e = getenv("LLAMA_KV_MASK_FAST"); return !e || atoi(e) != 0; }();
-    if (mask_fast && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_stream == 1 && n_tokens > 0) {
+    // standard SWA (the windowed MTP drafter, LLAMA_MTP_SWA): also masked when p1 - p0 >= n_swa
+    if (mask_fast && causal_attn && (swa_type == LLAMA_SWA_TYPE_NONE || swa_type == LLAMA_SWA_TYPE_STANDARD) && !hparams.use_alibi &&
+            n_stream == 1 && n_tokens > 0) {
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
         bool one = seq_id >= 0 && (size_t) seq_id < seq_to_stream.size();
         for (uint32_t i = 0; one && i < n_tokens; ++i) {
@@ -1834,6 +1836,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         if (one && n_kv <= (int64_t) cp->size()) {
             const llama_pos * P     = cp->pos_data();
             const bool        is_2d = ubatch->is_pos_2d();
+            const uint32_t    win   = swa_type == LLAMA_SWA_TYPE_STANDARD ? n_swa : UINT32_MAX;
             auto fill = [&](auto * data, auto keep, auto drop) {
                 for (uint32_t i = 0; i < n_tokens; ++i) {
                     const uint32_t  p1   = (uint32_t) ubatch->pos[i];
@@ -1842,7 +1845,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                     auto *          row  = data + n_kv*i;
                     for (int64_t j = 0; j < n_kv; ++j) {
                         const uint32_t p0 = (uint32_t) P[j];
-                        row[j] = p0 < p1 ? keep : p0 > p1 ? drop : (is_2d && cp->ext_get(j).is_2d_gt(p1_x, p1_y)) ? drop : keep;
+                        row[j] = p0 < p1 ? (p1 - p0 < win ? keep : drop) : p0 > p1 ? drop :
+                                 (is_2d && cp->ext_get(j).is_2d_gt(p1_x, p1_y)) ? drop : keep;
                     }
                 }
             };

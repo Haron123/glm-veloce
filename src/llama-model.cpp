@@ -2966,6 +2966,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // LLAMA_MTP_SWA=W (qwen4exp MTP draft context): the drafter attends to the last W positions only,
+                        // in a cache of W + n_ubatch cells that reuses the cells outside the window, so its attention
+                        // and prompt pass stop growing with the context. Only the drafts change (the target verifies
+                        // every drafted token). Default 16384 (below that context identical to full attention); 0: full
+                        static const int mtp_swa = [] { const char * e = getenv("LLAMA_MTP_SWA"); return e ? atoi(e) : 16384; }();
+                        const bool     swa_mtp  = mtp_swa > 0 && mtp_on_hybrid_qwen && arch == LLM_ARCH_QWEN4EXP;
+                        const uint32_t kv_size  = swa_mtp ? std::min<uint32_t>(cparams.n_ctx_seq,
+                                GGML_PAD((uint32_t) mtp_swa + cparams.n_ubatch, 256)) : cparams.n_ctx_seq;
+                        if (swa_mtp) {
+                            LLAMA_LOG_INFO("%s: MTP draft attention window %d (cache %u cells)\n", __func__, mtp_swa, kv_size);
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2974,11 +2986,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                swa_mtp ? (uint32_t) mtp_swa : hparams.n_swa,
+                                swa_mtp ? LLAMA_SWA_TYPE_STANDARD : hparams.swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
