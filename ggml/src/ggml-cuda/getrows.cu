@@ -698,6 +698,8 @@ static __global__ void __launch_bounds__(256) qsa_gather_score(const char * __re
 
 bool ggml_cuda_qsa_gather_score_supported(const ggml_tensor * gr, const ggml_tensor * mm) {
     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_QSA_SCORE_FUSE"); return !e || atoi(e) != 0; }();
+    // 12/16 columns: the MTP verify (4 heads x 3/4 tokens); GGML_CUDA_QSA_SCORE_FUSE_NT=0: those stay GET_ROWS + MUL_MAT
+    static const bool nt = [] { const char * e = getenv("GGML_CUDA_QSA_SCORE_FUSE_NT"); return !e || atoi(e) != 0; }();
     if (!enabled || !gr || !mm || mm->op != GGML_OP_MUL_MAT || mm->src[0] != gr || gr->op != GGML_OP_GET_ROWS) {
         return false;
     }
@@ -707,7 +709,8 @@ bool ggml_cuda_qsa_gather_score_supported(const ggml_tensor * gr, const ggml_ten
         ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
         gr->type == GGML_TYPE_F32 && gr->ne[0] == 128 && gr->ne[1] == ids->ne[0] && gr->ne[2] == 1 && gr->ne[3] == 1 &&
         gr->ne[1] <= INT_MAX &&
-        q->type == GGML_TYPE_F32 && q->ne[0] == 128 && q->ne[1] >= 1 && q->ne[1] <= 8 && q->ne[2] == 1 && q->ne[3] == 1 &&
+        q->type == GGML_TYPE_F32 && q->ne[0] == 128 && q->ne[1] >= 1 && (q->ne[1] <= 8 || (nt && (q->ne[1] == 12 || q->ne[1] == 16))) &&
+        q->ne[2] == 1 && q->ne[3] == 1 &&
         q->nb[0] == sizeof(float) && q->nb[1] % sizeof(float) == 0 &&
         mm->type == GGML_TYPE_F32 && mm->ne[0] == gr->ne[1] && mm->ne[1] == q->ne[1] && mm->ne[2] == 1 && mm->ne[3] == 1 &&
         mm->nb[0] == sizeof(float) && mm->nb[1] % sizeof(float) == 0;
@@ -764,7 +767,11 @@ void ggml_cuda_qsa_gather_score(ggml_backend_cuda_context & ctx, const ggml_tens
         case 5: QSA_GS(5); break;
         case 6: QSA_GS(6); break;
         case 7: QSA_GS(7); break;
-        default: QSA_GS(8); break;
+        case 8: QSA_GS(8); break;
+        // the MTP verify: 4 indexer heads x 3 (4) tokens; each column is summed exactly as with fewer columns
+        case 12: QSA_GS(12); break;
+        case 16: QSA_GS(16); break;
+        default: GGML_ABORT("qsa_gather_score: %d columns", (int) q->ne[1]);
     }
 #undef QSA_GS
     CUDA_CHECK(cudaGetLastError());
