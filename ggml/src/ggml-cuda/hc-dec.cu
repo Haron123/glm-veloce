@@ -732,7 +732,9 @@ static __device__ __forceinline__ float4 hc_dec_w4(const char * __restrict__ w, 
 // SIGMOID share the activation: one wave per output row (alpha rows first, then beta rows), f32 or bf16 weights
 // PRE (K = 2560: 10 float4 per lane): every weight load of the lane issued before the math (one memory round trip
 // instead of 10 dependent ones); the per-lane sums are formed in the same order, so the results are bit-identical
-template <int NT, bool BF16, bool PRE = false>
+// XLDS (PRE, 2..4 tokens): the tokens' x rows are staged in LDS once per block; the math reads them from there instead of
+// one dependent L2 round trip per K step (the weights are preloaded either way); same values, same sums
+template <int NT, bool BF16, bool PRE = false, bool XLDS = false>
 __launch_bounds__(256)
 static __global__ void gdn_ab_dec(
         const float * __restrict__ x, const char * __restrict__ wa, const char * __restrict__ wb, const float * __restrict__ dt,
@@ -740,6 +742,14 @@ static __global__ void gdn_ab_dec(
         const int64_t x_st, const int64_t wa_s, const int64_t wb_s, const int64_t g_st, const int64_t b_st) {
     const int r    = blockIdx.x*4 + threadIdx.x / 64;
     const int lane = threadIdx.x % 64;
+    constexpr int KQ = 2560/4;
+    __shared__ float4 xl[XLDS ? NT : 1][XLDS ? KQ : 1];
+    if constexpr (XLDS) {
+        for (int e = threadIdx.x; e < NT*KQ; e += 256) {
+            xl[e / KQ][e % KQ] = ((const float4 *) (x + (e / KQ)*x_st))[e % KQ];
+        }
+        __syncthreads();
+    }
     if (r >= 2*H) {
         return;
     }
@@ -760,7 +770,7 @@ static __global__ void gdn_ab_dec(
             const float4 w = wv[i];
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
-                const float4 v = ((const float4 *) (x + t*x_st))[lane + 64*i];
+                const float4 v = XLDS ? xl[XLDS ? t : 0][XLDS ? lane + 64*i : 0] : ((const float4 *) (x + t*x_st))[lane + 64*i];
                 acc[t] += w.x*v.x + w.y*v.y + w.z*v.z + w.w*v.w;
             }
         }
@@ -835,9 +845,11 @@ void ggml_cuda_gdn_ab_dec(ggml_backend_cuda_context & ctx, const ggml_tensor * m
     const dim3 grid((2*H + 3)/4);
     cudaStream_t stream = ctx.stream();
     static const int ab_pre_env = hc_dec_env("GGML_CUDA_GDN_AB_PRE", 1);
+    static const int ab_xlds    = hc_dec_env("GGML_CUDA_GDN_AB_XLDS", 1);
     const bool ab_pre = ab_pre_env && K == 2560;
-#define GDN_AB(NT, BF) if (ab_pre) { GDN_AB_(NT, BF, true) } else { GDN_AB_(NT, BF, false) }
-#define GDN_AB_(NT, BF, PRE) gdn_ab_dec<NT, BF, PRE><<<grid, 256, 0, stream>>>((const float *) x->data, (const char *) wa->data, \
+#define GDN_AB(NT, BF) if (ab_pre && ab_xlds && NT > 1) { GDN_AB_(NT, BF, true, true) } else if (ab_pre) { GDN_AB_(NT, BF, true, false) } \
+        else { GDN_AB_(NT, BF, false, false) }
+#define GDN_AB_(NT, BF, PRE, XL) gdn_ab_dec<NT, BF, PRE, XL><<<grid, 256, 0, stream>>>((const float *) x->data, (const char *) wa->data, \
         (const char *) wb->data, (const float *) add->src[1]->data, (const float *) A->data, (float *) gate->data, (float *) sig->data, \
         K, H, x->nb[1]/sizeof(float), wa->nb[1], wb->nb[1], H, H);
 #define GDN_AB_NT(BF) switch (nt) { case 1: GDN_AB(1, BF); break; case 2: GDN_AB(2, BF); break; case 3: GDN_AB(3, BF); break; \

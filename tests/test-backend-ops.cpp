@@ -10440,6 +10440,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_BF16, 10240, 1, {320, 4}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_BF16, 10240, 1, {320}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_BF16, 10240, 1, {4, 321, 7}));
+    for (int64_t n : {2, 3, 4}) { // MTP verify: the HC down + inject at 2..4 tokens (bf16mv_nt_dec)
+        test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_BF16, 10240, n, {320, 4}));
+    }
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 1024, 4, {5, 300, 77, 2, 2, 9, 128, 1}));
     // K-quant runs (GLM-5.3-Flash UD-Q2_K_XL at TP4: the q6_K k and v projections of a KDA layer), ragged row counts
     for (int64_t n : {1, 2, 4}) {
@@ -11728,6 +11731,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+
+    // q6_K matvecs at 2..4 columns (MTP verify; HIP: the pipelined loop), model shapes and an odd row count
+    for (int n : {2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 333,  n, 8192, {1, 1}, {1, 1}));
+    }
 
     // K not a multiple of 32
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  65, {1, 1}, {1, 1}));
