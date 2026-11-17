@@ -10483,6 +10483,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     // and its decode / MTP verify FFN (GCN: the flat gate/up pair kernel + the per-slot down), each gate/up type once,
     // plain SwiGLU; 16 experts keep the CPU reference quick (the kernels do not depend on the expert count)
+    // prefill sizes (> 64 tokens: the GCN tile path, K 640 for the down projection)
+    for (int64_t nt : {128, 512}) {
+        for (auto p : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0}, {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}}) {
+            test_cases.emplace_back(new test_moe_glu_pair(p[0], p[1], 2560, 640, 2560, nt, 16, 10, INFINITY));
+        }
+    }
     for (int64_t nt : {1, 2, 3}) {
         for (auto p : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0}, {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL},
                 {GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_0}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_NL}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0}}) {

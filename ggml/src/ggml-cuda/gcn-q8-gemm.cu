@@ -1488,7 +1488,9 @@ static __global__ void gcn_kq4_gemm(const char * __restrict__ w, const int8_t * 
     const int nsb_all = K / QK_K;
     const int sb_beg  = zs*sb_per_split;
     const int nsb     = min(sb_per_split, nsb_all - sb_beg);
-    const int nstep   = 2*nsb;
+    // K % QK_K == QK_K/2 (Qwen3.8-Flash-Next expert down, K = 640): iq4_nl / q2_0 blocks hold 32 / 64 values and a step's
+    // fetch reads only its half super-block's blocks, so the trailing half super-block is one more whole step (no split-K)
+    const int nstep   = (IS_IQ4NL || IS_Q20) && nsplit == 1 && K % QK_K == QK_K/2 ? K/(QK_K/2) : 2*nsb;
     dst += zs*split_stride;
     const char   * wbase = w   + (int64_t) row0*stride_row_w + (int64_t) sb_beg*gkq<T>::bytes;
     const int8_t * ybase = yq  + (int64_t) col0*K + (int64_t) sb_beg*QK_K;
@@ -2383,7 +2385,11 @@ bool ggml_cuda_gcn_kq_moe_supported(int cc, const ggml_tensor * src0, const ggml
     // 706 t/s with the tiles here, ub 1024 796 -> 789, ub 2048 (48) 798 -> 811); GGML_CUDA_GCN_KQ_MOE_MIN_AVG_IQ2XXS
     static const int min_avg_xxs = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MOE_MIN_AVG_IQ2XXS"); return e ? atoi(e) : 32; }();
     const int64_t min_avg_t = src0->type == GGML_TYPE_IQ2_XXS ? min_avg_xxs : min_avg_iq;
-    return type_ok && ((iq || nlq2) ? n_tokens > dec_max && avg >= min_avg_t : avg >= min_avg) && K % QK_K == 0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    // GGML_CUDA_GCN_KQ_MOE_K128=0: iq4_nl / q2_0 with K = 256*n + 128 (this model's expert down, K 640) back on MMQ
+    static const int env_k128 = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_MOE_K128"); return e ? atoi(e) : 1; }();
+    const bool k_ok = K % QK_K == 0 || (env_k128 && (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q2_0) &&
+                                        K % QK_K == QK_K/2);
+    return type_ok && ((iq || nlq2) ? n_tokens > dec_max && avg >= min_avg_t : avg >= min_avg) && k_ok && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[1] == n_tokens && src0->ne[3] == 1 &&
         src1->ne[3] == 1 && ggml_is_contiguous(src0) && src0->nb[1] % wal == 0 && src0->nb[2] % wal == 0 &&
         ((uintptr_t) src0->data) % wal == 0 && src1->nb[0] == sizeof(float) && src1->nb[2] == src1->ne[1]*src1->nb[1] &&
