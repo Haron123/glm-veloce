@@ -156,3 +156,10 @@ AGENTS.local.md
 
 # benchmark outputs of tools/mi50 (kept in ~/glm-veloce-work/runs)
 /runs/
+
+# AI agent documents: kept locally, not published
+/CLAUDE.md
+/AGENTS.md
+/current.md
+/fable.md
+/tg-research-*.md
