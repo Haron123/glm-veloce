@@ -209,10 +209,21 @@ __launch_bounds__(SHEXP_DOWN_NT)
 static __global__ void shexp_down_dec(
         const char * __restrict__ Wd, const int64_t sd, const int M, const int R, const float * __restrict__ gu,
         const float * __restrict__ gdot, const float * __restrict__ moe, float * __restrict__ out,
-        const float * __restrict__ experts, const float * __restrict__ ew, const int n_used, const int NT) {
+        const float * __restrict__ experts, const float * __restrict__ ew, const int n_used, const int NT, const int dn_pf = 0) {
     extern __shared__ block_q8_1 shexp_hq[]; // NT x R/32 blocks
     const int wave = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
+    // one token with the routed experts' sum: lane e (< n_used) loads expert e's value for this row and its weight now
+    // (inputs ready at kernel start), overlapping the prologue; lane 0 sums them in expert order at the end through
+    // shuffles, the same expression as the old per-expert loop (bit-identical). GGML_CUDA_SHEXP_DN_PF=0: the old loop
+    float pe = 0.0f, pwt = 0.0f;
+    {
+        const int r_pf = blockIdx.x*(SHEXP_DOWN_NT/WARP_SIZE) + wave;
+        if (!MULTI && dn_pf && experts && r_pf < M && lane < n_used) {
+            pe  = experts[(int64_t) lane*M + r_pf];
+            pwt = ew[lane];
+        }
+    }
     // h = silu(g)*u and its q8_1 copy per token, quantized as quantize_q8_1 does (groups of 32 lanes = one block)
     for (int t = 0; t < NT; ++t) {
         const float * gut = gu + t*2*R;
@@ -256,15 +267,25 @@ static __global__ void shexp_down_dec(
     {
         const int t = 0;
         const float v = shexp_row_dot<td>(Wd + r*sd, shexp_hq, R/ggml_cuda_type_traits<td>::qk, lane);
+        float mpf = 0.0f;
+        if (experts && dn_pf) {
+            for (int e = 0; e < n_used; ++e) {
+                const float a = __shfl(pe, e, WARP_SIZE);
+                const float b = __shfl(pwt, e, WARP_SIZE);
+                mpf += a*b;
+            }
+        }
         if (lane == 0) {
             const float s = 1.0f/(1.0f + expf(-gdot[t]));
             float m;
-            if (experts) {
+            if (experts && !dn_pf) {
                 // the routed experts' weighted sum, as moe_weighted_reduction forms it (0 + sum of x*w in expert order)
                 m = 0.0f;
                 for (int e = 0; e < n_used; ++e) {
                     m += experts[(int64_t) e*M + r]*ew[e];
                 }
+            } else if (experts) {
+                m = mpf;
             } else {
                 m = moe[t*M + r];
             }
@@ -365,8 +386,9 @@ void ggml_cuda_shexp_dec(ggml_backend_cuda_context & ctx, const ggml_tensor * co
 
     const size_t smem = (size_t) nt*(R/QK8_1)*sizeof(block_q8_1);
     const int nb2 = (M + SHEXP_DOWN_NT/WARP_SIZE - 1)/(SHEXP_DOWN_NT/WARP_SIZE);
+    static const int dn_pf = [] { const char * e = getenv("GGML_CUDA_SHEXP_DN_PF"); return e ? atoi(e) : 1; }();
 #define SHEXP_DN(TD, MU) shexp_down_dec<TD, MU><<<nb2, SHEXP_DOWN_NT, smem, stream>>>((const char *) wd->data, wd->nb[1], M, R, \
-        gu.get(), gdot, (const float *) moe->data, (float *) add->data, experts, ew, n_used, nt)
+        gu.get(), gdot, (const float *) moe->data, (float *) add->data, experts, ew, n_used, nt, (dn_pf && n_used <= WARP_SIZE) ? 1 : 0)
     if (wd->type == GGML_TYPE_IQ4_NL) {
         if (nt > 1) SHEXP_DN(GGML_TYPE_IQ4_NL, true); else SHEXP_DN(GGML_TYPE_IQ4_NL, false);
     } else {
