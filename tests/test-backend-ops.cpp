@@ -11738,6 +11738,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // dense prefill GEMMs on the GCN v4 tiles: iq3_s / iq2_s (K 2560), iq4_nl / q2_0 with K 640 (a half super-block)
+    for (int n : {64, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_S,  GGML_TYPE_F32, 1280, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 2560, n,  640, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0,   GGML_TYPE_F32, 2560, n,  640, {1, 1}, {1, 1}));
+    }
     // q6_K matvecs at 2..4 columns (MTP verify; HIP: the pipelined loop), model shapes and an odd row count
     for (int n : {2, 3, 4}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));

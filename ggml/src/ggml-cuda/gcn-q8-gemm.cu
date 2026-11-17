@@ -2071,16 +2071,27 @@ bool ggml_cuda_gcn_kq_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         case GGML_TYPE_Q3_K:   bit = 32; break;
         case GGML_TYPE_Q2_K:   bit = 64; break;
         case GGML_TYPE_Q8_0:   bit = 128; break;
+        // GGML_CUDA_GCN_KQ_IQ (default 1): iq3_s / iq2_s / q2_0 dense matrices on the v4 tiles (their MoE fetch code), and
+        // iq4_nl with K = 256n + 128 (Qwen3.8-Flash-Next: the shared expert down, K 640); MMQ before
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_Q2_0:   bit = 512; break;
         default: return false;
     }
-    if (!(mask & bit)) {
+    static const int env_iq = [] { const char * e = getenv("GGML_CUDA_GCN_KQ_IQ"); return e ? atoi(e) : 1; }();
+    if (bit == 512 && !env_iq) {
+        return false;
+    }
+    if (bit != 512 && !(mask & bit)) {
         return false;
     }
     const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
     // a batch of matrices (e.g. DeepSeek V4's grouped output projection: 8 x (1024 x 4096)) runs as blockIdx.z of v4,
     // without broadcasting
     const int64_t nbatch = src0->ne[2];
-    if (M < min_rows || K % QK_K != 0 || N < 32 || src0->ne[3] != 1 || src1->ne[2] != nbatch || src1->ne[3] != 1 ||
+    // a trailing half super-block (K % QK_K == QK_K/2): iq4_nl / q2_0 on v4 only, without split-K (see gcn_kq4_gemm)
+    const bool k_half = env_iq && (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q2_0) && K % QK_K == QK_K/2;
+    if (M < min_rows || (K % QK_K != 0 && !k_half) || N < 32 || src0->ne[3] != 1 || src1->ne[2] != nbatch || src1->ne[3] != 1 ||
             dst->ne[2] != nbatch || dst->nb[0] != sizeof(float) || !ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) ||
             src0->nb[1] % 4 != 0 || ((uintptr_t) src0->data) % 4 != 0 || (nbatch > 1 && src1->nb[2] % 8 != 0)) {
         return false;
@@ -2092,12 +2103,12 @@ bool ggml_cuda_gcn_kq_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     // back to v1 for iq4_xs at <= 128 tokens (v1's 8 x 4 register tile was 7-10% faster there, equal at 512-2048)
     static const int kqv_env = [] { const char * e = getenv("GGML_CUDA_GCN_KQV"); return e ? atoi(e) : 4; }();
     const int  wal  = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K ? 16 : src0->type == GGML_TYPE_IQ4_XS ? 8 : 4;
-    const bool v34  = src0->type != GGML_TYPE_IQ4_NL && src1->nb[1] % 8 == 0 && ((uintptr_t) src1->data) % 8 == 0 &&
+    const bool v34  = (src0->type != GGML_TYPE_IQ4_NL || k_half) && src1->nb[1] % 8 == 0 && ((uintptr_t) src1->data) % 8 == 0 &&
         src0->nb[1] % wal == 0 && ((uintptr_t) src0->data) % wal == 0;
     const bool v4 = v34 && kqv_env == 4 && !(src0->type == GGML_TYPE_IQ4_XS && N <= 128);
     const bool v3 = v34 && kqv_env == 3;
-    if ((src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q8_0 || nbatch > 1) && !v4) {
-        return false; // q2_K, q8_0 and batches: v4 only
+    if ((src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q8_0 || bit == 512 || k_half || nbatch > 1) && !v4) {
+        return false; // q2_K, q8_0, the i-quants above, half super-blocks and batches: v4 only
     }
     const int  BM  = v3 || v4 ? G3_BM : GQ_BM;
     const int  BN  = v3 || v4 ? G3_BN : GQ_BN;
@@ -2131,7 +2142,7 @@ bool ggml_cuda_gcn_kq_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int tiles = (int) (((M + BM - 1)/BM) * ((N + BN - 1)/BN));
     const int nsb   = (int) (K / QK_K);
     int nsplit = 1;
-    if (nbatch == 1 && tiles < 2*bpc*nsm) { // fewer than 2 rounds: each extra slice also costs a partial write and the reduction
+    if (nbatch == 1 && tiles < 2*bpc*nsm && !k_half) { // fewer than 2 rounds: each extra slice also costs a partial write and the reduction
         int64_t best = INT64_MAX;
         for (int ns = 1; ns <= 8 && ns <= nsb; ++ns) {
             const int64_t cost = (int64_t) ((tiles*ns + bpc*nsm - 1)/(bpc*nsm)) * ((nsb + ns - 1)/ns) + (ns > 1 ? ns : 0);
@@ -2142,7 +2153,7 @@ bool ggml_cuda_gcn_kq_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         }
     }
     static const int split_env = [] { const char * e = getenv("GGML_CUDA_GCN_GEMM_SPLIT"); return e ? atoi(e) : 0; }();
-    if (split_env > 0 && nbatch == 1) {
+    if (split_env > 0 && nbatch == 1 && !k_half) {
         nsplit = split_env;
     }
     const int sb_per_split = (nsb + nsplit - 1) / nsplit;
@@ -2169,6 +2180,10 @@ bool ggml_cuda_gcn_kq_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             case GGML_TYPE_Q3_K:   GKQ4_LAUNCH(GGML_TYPE_Q3_K);   break;
             case GGML_TYPE_Q2_K:   GKQ4_LAUNCH(GGML_TYPE_Q2_K);   break;
             case GGML_TYPE_Q8_0:   GKQ4_LAUNCH(GGML_TYPE_Q8_0);   break;
+            case GGML_TYPE_IQ3_S:  GKQ4_LAUNCH(GGML_TYPE_IQ3_S);  break;
+            case GGML_TYPE_IQ2_S:  GKQ4_LAUNCH(GGML_TYPE_IQ2_S);  break;
+            case GGML_TYPE_Q2_0:   GKQ4_LAUNCH(GGML_TYPE_Q2_0);   break;
+            case GGML_TYPE_IQ4_NL: GKQ4_LAUNCH(GGML_TYPE_IQ4_NL); break;
             default:               GKQ4_LAUNCH(GGML_TYPE_IQ4_XS); break;
         }
 #undef GKQ4_LAUNCH
