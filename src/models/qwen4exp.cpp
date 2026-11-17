@@ -642,8 +642,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
+    // see LLAMA_MTP_KV_ONLY below: that graph reads no output row, so it gets no output-ids input (an input left out of
+    // the graph has no buffer to fill)
+    static const bool kv_only = [] { const char * e = getenv("LLAMA_MTP_KV_ONLY"); return !e || atoi(e) != 0; }();
+    const bool kv_only_now = kv_only && n_outputs == 0;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only_now ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -708,6 +713,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(Qcur, "mtp_Qcur", il);
     cb(Kcur, "mtp_Kcur", il);
+
+    // a catch-up ubatch without outputs (prompt chunks; the accepted rows after a verify) only has to leave its K/V in
+    // the cache: no row of the attention output, the FFN or the head is read, and with no attention node the KQ mask
+    // is neither filled nor uploaded (512 x 16K f16 per prompt ubatch). The K/V ops are the full graph's, so the drafts
+    // are unchanged. LLAMA_MTP_KV_ONLY=0: the full graph
+    {
+        if (kv_only_now && !inp_attn->self_k_rot && !inp_attn->self_v_rot) {
+            ggml_build_forward_expand(gf, Vcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+            return;
+        }
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
@@ -804,6 +823,28 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_build_forward_expand(gf, lo2);
         cur = ggml_concat(ctx0, lo2, hi, 0);
         cb(cur, "result_output_cat_pin", -1);
+    } else if (draft_vocab > 0 && draft_vocab < n_vocab_head && head_w == head_owner->output &&
+               head_owner->output_lo != nullptr && head_s == nullptr && qwen4exp_head_split_use() && n_outputs >= 1 &&
+               n_outputs <= 4 && draft_vocab/2 <= head_owner->output_lo->ne[1] && draft_vocab % 512 == 0) {
+        // reduced vocabulary on both GPUs: rows [0, K/2) from output.lo on the first device, [K/2, K) from the head on
+        // the last; joined and padded as the single-device path below (pins as in the full split head above)
+        const int64_t k2 = draft_vocab/2;
+        ggml_tensor * w_lo = ggml_view_2d(ctx0, head_owner->output_lo, head_w->ne[0], k2, head_owner->output_lo->nb[1], 0);
+        ggml_backend_view_init(w_lo);
+        ggml_tensor * lo = build_lora_mm(w_lo, cur, nullptr);
+        ggml_build_forward_expand(gf, lo);
+        ggml_tensor * w_hi = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab - k2, head_w->nb[1], k2*head_w->nb[1]);
+        ggml_backend_view_init(w_hi);
+        ggml_tensor * hi = build_lora_mm(w_hi, cur, nullptr);
+        ggml_build_forward_expand(gf, hi);
+        ggml_tensor * lo2 = ggml_scale(ctx0, lo, 1.0f);
+        cb(lo2, "result_output_lo_pin", -1);
+        ggml_build_forward_expand(gf, lo2);
+        cur = ggml_concat(ctx0, lo2, hi, 0);
+        cb(cur, "result_output_cat_pin", -1);
+        cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
+        cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - draft_vocab), 0, 0, 0);
+        cur = ggml_scale_bias(ctx0, cur, 1.0f, -1.0e4f);
     } else if (draft_vocab > 0 && draft_vocab < n_vocab_head && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
         ggml_tensor * w_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
         cur = build_lora_mm(w_sub, cur, head_s);

@@ -2090,6 +2090,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int64_t tc0 = g_spec_t.on ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 if (g_spec_t.on) { g_spec_t.t_catch += ggml_time_us() - tc0; g_spec_t.n_catch++; }
+                {
+                    // LLAMA_SPEC_TIMING=2: each catch-up decode of more than 64 rows (prompt chunks), synchronized
+                    static const bool each = [] { const char * e = getenv("LLAMA_SPEC_TIMING"); return e && atoi(e) >= 2; }();
+                    if (each && batch.n_tokens > 64) {
+                        const int64_t t0s = ggml_time_us();
+                        llama_synchronize(ctx_dft);
+                        fprintf(stderr, "spec catch-up: %d rows from pos %d: submit %.2f ms + gpu %.2f ms\n", batch.n_tokens,
+                                (int) batch.pos[0], (t0s - tc0)/1e3, (ggml_time_us() - t0s)/1e3);
+                    }
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
