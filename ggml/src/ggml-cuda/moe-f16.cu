@@ -1113,6 +1113,11 @@ void ggml_cuda_hc_combine_norm(ggml_backend_cuda_context & ctx, ggml_tensor * po
 // separate combine and norm kernels). Same read-before-barrier order, so the same aliasing rules. Saves the norm launch.
 // NS = 1: one block per (stream, token), 4x the blocks for the same per-stream sums (bit-identical); only when xn
 // overlaps no input that another stream's block reads
+// rdf (NS = 1 only): xn overlaps an input another block reads; every block of the launch has read all its inputs before
+// any block writes (device-scope counter, reset by the last block through), so the 4-blocks-per-token shape also covers
+// the aliased allocations that used to take the single 1024-thread block (same per-stream sums: bit-identical)
+static __device__ unsigned int g_hc_cn_rd[GGML_CUDA_MAX_DEVICES][2];
+
 template <bool RAWP, int NS = 4>
 __launch_bounds__(256*NS)
 static __global__ void hc_combine_norm_dec(
@@ -1120,7 +1125,7 @@ static __global__ void hc_combine_norm_dec(
         const float * __restrict__ w, float * __restrict__ x_out, float * __restrict__ xn_out,
         const int n_embd, const int64_t s_res, const int64_t s_bo, const int64_t sp0, const int64_t sp1,
         const int64_t s_x, const int64_t s_xn, const float eps, const float ps1, const float ps2,
-        block_q8_1 * __restrict__ xq, const int64_t s_xq) {
+        block_q8_1 * __restrict__ xq, const int64_t s_xq, unsigned int * rdf = nullptr) {
     constexpr int MAXV = 4; // float4 per thread: n_embd <= 4096
     constexpr int GW   = 256/WARP_SIZE; // warps per stream
     const int64_t t = NS == 4 ? blockIdx.x : blockIdx.x / 4;
@@ -1162,6 +1167,19 @@ static __global__ void hc_combine_norm_dec(
         tot += red[sl*GW + i];
     }
     const float r = rsqrtf(tot/n_embd + eps);
+    if (NS == 1 && rdf != nullptr) {
+        if (threadIdx.x == 0) {
+            __hip_atomic_fetch_add(&rdf[0], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            while (__hip_atomic_load(&rdf[0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < gridDim.x) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+            if (__hip_atomic_fetch_add(&rdf[1], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == gridDim.x - 1) {
+                rdf[0] = 0; // every block has passed the wait
+                rdf[1] = 0;
+            }
+        }
+        __syncthreads();
+    }
     float4 * xp = (float4 *) (x_out + t*s_x + (int64_t) s*n_embd);
     float4 * op = (float4 *) (xn_out + t*s_xn + (int64_t) s*n_embd);
 #pragma unroll
@@ -1230,8 +1248,15 @@ void ggml_cuda_hc_combine_norm_dec(ggml_backend_cuda_context & ctx, ggml_tensor 
     // one block per stream when xn overlaps nothing another stream's block reads (it may exactly replace the residual)
     static const bool split_env = [] { const char * e = getenv("GGML_HC_COMBINE_NORM_SPLIT"); return !e || atoi(e) != 0; }();
     const bool xn_on_res = mul->data == res->data && ggml_are_same_shape(mul, res) && ggml_are_same_stride(mul, res);
-    const bool split = split_env && !hc_ranges_overlap(mul, bo) && !hc_ranges_overlap(mul, pw) &&
-        (!hc_ranges_overlap(mul, res) || xn_on_res);
+    const bool alias = hc_ranges_overlap(mul, bo) || hc_ranges_overlap(mul, pw) || (hc_ranges_overlap(mul, res) && !xn_on_res);
+    // GGML_HC_COMBINE_NORM_SYNC=0: an aliased xn takes the single block per token as before
+    static const bool sync_env = [] { const char * e = getenv("GGML_HC_COMBINE_NORM_SYNC"); return !e || atoi(e) != 0; }();
+    const bool split = split_env && (!alias || (sync_env && x->ne[2] <= 16));
+    unsigned int * rdf = nullptr;
+    if (split && alias) {
+        CUDA_CHECK(hipGetSymbolAddress((void **) &rdf, HIP_SYMBOL(g_hc_cn_rd)));
+        rdf += 2*ctx.device;
+    }
     const unsigned nb = split ? 4*(unsigned) x->ne[2] : (unsigned) x->ne[2];
     auto kern = split ? (raw_post ? hc_combine_norm_dec<true, 1> : hc_combine_norm_dec<false, 1>) :
                         (raw_post ? hc_combine_norm_dec<true, 4> : hc_combine_norm_dec<false, 4>);
@@ -1240,7 +1265,7 @@ void ggml_cuda_hc_combine_norm_dec(ggml_backend_cuda_context & ctx, ggml_tensor 
         (const float *) w->data, (float *) post_node->data, (float *) mul->data,
         (int) x->ne[0], post_node->src[1]->nb[2]/sizeof(float), bo->nb[1]/sizeof(float), pw->nb[0]/sizeof(float),
         pw->nb[1]/sizeof(float), post_node->nb[2]/sizeof(float), mul->nb[2]/sizeof(float),
-        ggml_get_op_params_f32(rms, 0), ps1, ps2, (block_q8_1 *) xq, s_xq);
+        ggml_get_op_params_f32(rms, 0), ps1, ps2, (block_q8_1 *) xq, s_xq, rdf);
     CUDA_CHECK(cudaGetLastError());
 }
 
